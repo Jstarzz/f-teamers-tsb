@@ -66,11 +66,12 @@ local angle = 0
 local ORBIT_RADIUS = 3
 local ORBIT_HEIGHT = -6 -- lower = farther below the target
 local ORBIT_SPEED = 4
-
+local FOLLOW_PREDICTION = 0.20
 local TIME_BETWEEN_M1S = 0.18
 local TIME_BETWEEN_TOOLS = 0.45
 local TIME_BETWEEN_ROUNDS = 0.75
 local PAUSE_CHECK_DELAY = 0.5
+
 
 local function getCharacter(targetPlayer)
     return targetPlayer and targetPlayer.Character
@@ -194,9 +195,8 @@ local function startOrbit(target, session)
         myHumanoid.PlatformStand = true
     end
 
-    orbitConnection = RunService.Heartbeat:Connect(function(deltaTime)
+    orbitConnection = RunService.RenderStepped:Connect(function(deltaTime)
         if not canAttack(session, target) then
-            -- Pause only. The main loop resumes this after respawn.
             stopOrbit()
             return
         end
@@ -211,14 +211,22 @@ local function startOrbit(target, session)
 
         angle = angle + ORBIT_SPEED * deltaTime
 
-        local orbitPosition = targetRoot.Position + Vector3.new(
+        -- Predict slightly ahead based on horizontal movement.
+        local velocity = targetRoot.AssemblyLinearVelocity
+        local horizontalVelocity = Vector3.new(velocity.X, 0, velocity.Z)
+        local predictedTargetPosition = targetRoot.Position
+            + horizontalVelocity * FOLLOW_PREDICTION
+
+        local orbitPosition = predictedTargetPosition + Vector3.new(
             math.cos(angle) * ORBIT_RADIUS,
             ORBIT_HEIGHT,
             math.sin(angle) * ORBIT_RADIUS
         )
 
-        -- Position below the target but always rotate toward them.
-        myRoot.CFrame = CFrame.lookAt(orbitPosition, targetRoot.Position)
+        myRoot.CFrame = CFrame.lookAt(
+            orbitPosition,
+            predictedTargetPosition
+        )
     end)
 end
 
