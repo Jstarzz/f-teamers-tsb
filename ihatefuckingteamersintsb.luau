@@ -37,9 +37,16 @@ if remote then
     })
 end
 ]]--
-local WindUI = loadstring(game:HttpGet(
-    "https://github.com/Footagesus/WindUI/releases/latest/download/main.lua"
-))()
+local loadOk, WindUI = pcall(function()
+    return loadstring(game:HttpGet(
+        "https://github.com/Footagesus/WindUI/releases/latest/download/main.lua"
+    ))()
+end)
+
+if not loadOk then
+    warn("WindUI failed to load:", WindUI)
+    return
+end
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -48,28 +55,25 @@ local player = Players.LocalPlayer
 
 local selectedTargetName = nil
 local comboEnabled = false
-local workerId = 0
+local comboSession = 0
 
 local orbitConnection = nil
-local orbitHumanoid = nil
+local controlledHumanoid = nil
 local oldPlatformStand = false
 local angle = 0
 
+-- Timing / orbit settings
 local ORBIT_RADIUS = 3
-local ORBIT_HEIGHT = -6
+local ORBIT_HEIGHT = -6 -- lower = farther below the target
 local ORBIT_SPEED = 4
 
-local M1_DELAY = 0.18
-local TOOL_DELAY = 0.45
-local ROUND_DELAY = 0.75
-local DEAD_PAUSE_DELAY = 0.5
+local TIME_BETWEEN_M1S = 0.18
+local TIME_BETWEEN_TOOLS = 0.45
+local TIME_BETWEEN_ROUNDS = 0.75
+local PAUSE_CHECK_DELAY = 0.5
 
 local function getCharacter(targetPlayer)
-    if not targetPlayer then
-        return nil
-    end
-
-    return targetPlayer.Character
+    return targetPlayer and targetPlayer.Character
 end
 
 local function getHumanoid(targetPlayer)
@@ -96,11 +100,7 @@ local function isAlive(targetPlayer)
     local humanoid = getHumanoid(targetPlayer)
     local root = getRoot(targetPlayer)
 
-    if not humanoid or not root then
-        return false
-    end
-
-    return humanoid.Health > 0
+    return humanoid and humanoid.Health > 0 and root
 end
 
 local function getRemote()
@@ -113,17 +113,53 @@ local function getRemote()
     return character:FindFirstChild("Communicate")
 end
 
+local function getToolNames()
+    local backpack = player:FindFirstChild("Backpack")
+    local toolNames = {}
+
+    if not backpack then
+        return toolNames
+    end
+
+    for _, item in ipairs(backpack:GetChildren()) do
+        if item:IsA("Tool") then
+            table.insert(toolNames, item.Name)
+        end
+    end
+
+    table.sort(toolNames)
+
+    return toolNames
+end
+
+local function findTool(toolName)
+    local backpack = player:FindFirstChild("Backpack")
+    local character = player.Character
+
+    local tool = backpack and backpack:FindFirstChild(toolName)
+
+    if not tool and character then
+        tool = character:FindFirstChild(toolName)
+    end
+
+    if tool and tool:IsA("Tool") then
+        return tool
+    end
+
+    return nil
+end
+
 local function stopOrbit()
     if orbitConnection then
         orbitConnection:Disconnect()
         orbitConnection = nil
     end
 
-    if orbitHumanoid and orbitHumanoid.Parent then
-        orbitHumanoid.PlatformStand = oldPlatformStand
+    if controlledHumanoid and controlledHumanoid.Parent then
+        controlledHumanoid.PlatformStand = oldPlatformStand
     end
 
-    orbitHumanoid = nil
+    controlledHumanoid = nil
 end
 
 local function getSelectedTarget()
@@ -134,43 +170,33 @@ local function getSelectedTarget()
     return Players:FindFirstChild(selectedTargetName)
 end
 
-local function isActive(id, target)
-    if not comboEnabled then
-        return false
-    end
-
-    if workerId ~= id then
-        return false
-    end
-
-    if not target then
-        return false
-    end
-
-    return true
+local function isSessionActive(session)
+    return comboEnabled and comboSession == session
 end
 
-local function startOrbit(target, id)
+local function canAttack(session, target)
+    return isSessionActive(session)
+        and target
+        and isAlive(player)
+        and isAlive(target)
+end
+
+local function startOrbit(target, session)
     if orbitConnection then
         return
     end
 
-    local humanoid = getHumanoid(player)
+    local myHumanoid = getHumanoid(player)
 
-    if humanoid then
-        orbitHumanoid = humanoid
-        oldPlatformStand = humanoid.PlatformStand
-        humanoid.PlatformStand = true
+    if myHumanoid then
+        controlledHumanoid = myHumanoid
+        oldPlatformStand = myHumanoid.PlatformStand
+        myHumanoid.PlatformStand = true
     end
 
     orbitConnection = RunService.Heartbeat:Connect(function(deltaTime)
-        if not isActive(id, target) then
-            stopOrbit()
-            return
-        end
-
-        -- Death pauses only. It never disables the toggle.
-        if not isAlive(player) or not isAlive(target) then
+        if not canAttack(session, target) then
+            -- Pause only. The main loop resumes this after respawn.
             stopOrbit()
             return
         end
@@ -191,57 +217,14 @@ local function startOrbit(target, id)
             math.sin(angle) * ORBIT_RADIUS
         )
 
+        -- Position below the target but always rotate toward them.
         myRoot.CFrame = CFrame.lookAt(orbitPosition, targetRoot.Position)
     end)
 end
 
-local function getToolNames()
-    local backpack = player:FindFirstChild("Backpack")
-    local names = {}
-
-    if not backpack then
-        return names
-    end
-
-    for _, item in ipairs(backpack:GetChildren()) do
-        if item:IsA("Tool") then
-            table.insert(names, item.Name)
-        end
-    end
-
-    table.sort(names)
-
-    return names
-end
-
-local function findTool(toolName)
-    local backpack = player:FindFirstChild("Backpack")
-    local character = player.Character
-
-    local tool = nil
-
-    if backpack then
-        tool = backpack:FindFirstChild(toolName)
-    end
-
-    if not tool and character then
-        tool = character:FindFirstChild(toolName)
-    end
-
-    if tool and tool:IsA("Tool") then
-        return tool
-    end
-
-    return nil
-end
-
-local function doM1(id, target)
+local function doM1(session, target)
     for _ = 1, 3 do
-        if not isActive(id, target) then
-            return false
-        end
-
-        if not isAlive(player) or not isAlive(target) then
+        if not canAttack(session, target) then
             return false
         end
 
@@ -261,18 +244,14 @@ local function doM1(id, target)
             Goal = "LeftClickRelease",
         })
 
-        task.wait(M1_DELAY)
+        task.wait(TIME_BETWEEN_M1S)
     end
 
     return true
 end
 
-local function useTool(toolName, id, target)
-    if not isActive(id, target) then
-        return false
-    end
-
-    if not isAlive(player) or not isAlive(target) then
+local function fireMove(toolName, session, target)
+    if not canAttack(session, target) then
         return false
     end
 
@@ -293,59 +272,61 @@ local function useTool(toolName, id, target)
     return true
 end
 
-local function doComboRound(id, target)
+local function doComboRound(session, target)
     local toolNames = getToolNames()
     local toolCount = math.min(#toolNames, 4)
 
     for index = 1, toolCount do
-        if not doM1(id, target) then
+        if not doM1(session, target) then
             return
         end
 
-        if not useTool(toolNames[index], id, target) then
+        if not fireMove(toolNames[index], session, target) then
             return
         end
 
         if index < toolCount then
-            task.wait(TOOL_DELAY)
+            task.wait(TIME_BETWEEN_TOOLS)
         end
     end
 end
 
-local function startWorker()
-    workerId = workerId + 1
+local function stopCombo()
+    comboEnabled = false
+    comboSession = comboSession + 1
+    stopOrbit()
+end
 
-    local id = workerId
+local function startCombo()
+    local target = getSelectedTarget()
+
+    if not target or target == player then
+        warn("Select a valid target.")
+        return
+    end
+
+    comboEnabled = true
+    comboSession = comboSession + 1
+
+    local session = comboSession
 
     task.spawn(function()
-        while isActive(id, getSelectedTarget()) do
-            local target = getSelectedTarget()
+        while isSessionActive(session) do
+            target = getSelectedTarget()
 
             if target and isAlive(player) and isAlive(target) then
-                startOrbit(target, id)
-                doComboRound(id, target)
-                task.wait(ROUND_DELAY)
+                startOrbit(target, session)
+                doComboRound(session, target)
+                task.wait(TIME_BETWEEN_ROUNDS)
             else
-                -- Target is dead: wait here until they respawn.
-                -- comboEnabled remains true.
+                -- Keep the UI and toggle enabled; simply wait for respawn.
                 stopOrbit()
-                task.wait(DEAD_PAUSE_DELAY)
+                task.wait(PAUSE_CHECK_DELAY)
             end
         end
 
         stopOrbit()
     end)
-end
-
-local function setComboEnabled(enabled)
-    comboEnabled = enabled
-
-    workerId = workerId + 1
-    stopOrbit()
-
-    if comboEnabled then
-        startWorker()
-    end
 end
 
 local function getPlayerNames()
@@ -365,8 +346,8 @@ end
 local Window = WindUI:CreateWindow({
     Title = "Combat Test",
     Icon = "crosshair",
-    Size = UDim2.fromOffset(420, 240),
-    MinSize = Vector2.new(420, 240),
+    Size = UDim2.fromOffset(420, 245),
+    MinSize = Vector2.new(420, 245),
     Theme = "Dark",
     Transparent = true,
     Resizable = false,
@@ -378,23 +359,26 @@ local Tab = Window:Tab({
     Icon = "crosshair",
 })
 
-local initialNames = getPlayerNames()
-selectedTargetName = initialNames[1]
+local playerNames = getPlayerNames()
 
 local targetDropdown = Tab:Dropdown({
     Title = "Target player",
-    Values = initialNames,
-    Value = selectedTargetName,
+    Values = playerNames,
+    Value = playerNames[1],
     Multi = false,
     AllowNone = true,
     Callback = function(playerName)
         selectedTargetName = playerName
 
         if comboEnabled then
-            startWorker()
+            comboSession = comboSession + 1
+            stopOrbit()
+            startCombo()
         end
     end,
 })
+
+selectedTargetName = playerNames[1]
 
 Tab:Button({
     Title = "Refresh players",
@@ -405,13 +389,12 @@ Tab:Button({
 
         if selectedTargetName and Players:FindFirstChild(selectedTargetName) then
             targetDropdown:Select(selectedTargetName)
-            return
-        end
+        else
+            selectedTargetName = names[1]
 
-        selectedTargetName = names[1]
-
-        if selectedTargetName then
-            targetDropdown:Select(selectedTargetName)
+            if selectedTargetName then
+                targetDropdown:Select(selectedTargetName)
+            end
         end
     end,
 })
@@ -420,7 +403,11 @@ Tab:Toggle({
     Title = "Combo attack",
     Value = false,
     Callback = function(enabled)
-        setComboEnabled(enabled)
+        if enabled then
+            startCombo()
+        else
+            stopCombo()
+        end
     end,
 })
 
