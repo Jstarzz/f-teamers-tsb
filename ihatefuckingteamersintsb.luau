@@ -62,19 +62,27 @@ local controlledHumanoid = nil
 local oldPlatformStand = false
 local angle = 0
 
--- Timing / orbit settings
+local lastToolSignature = nil
+local pauseUntil = 0
+
 local ORBIT_RADIUS = 3
-local ORBIT_HEIGHT = -6 -- lower = farther below the target
+local ORBIT_HEIGHT = -6
 local ORBIT_SPEED = 4
-local FOLLOW_PREDICTION = 0.20
+local FOLLOW_PREDICTION = 0.18
+local MAX_FOLLOW_LEAD = 12
+
 local TIME_BETWEEN_M1S = 0.18
 local TIME_BETWEEN_TOOLS = 0.45
 local TIME_BETWEEN_ROUNDS = 0.75
-local PAUSE_CHECK_DELAY = 0.5
-
+local PAUSE_CHECK_DELAY = 0.15
+local G_PAUSE_DURATION = 0.5
 
 local function getCharacter(targetPlayer)
-    return targetPlayer and targetPlayer.Character
+    if not targetPlayer then
+        return nil
+    end
+
+    return targetPlayer.Character
 end
 
 local function getHumanoid(targetPlayer)
@@ -99,9 +107,8 @@ end
 
 local function isAlive(targetPlayer)
     local humanoid = getHumanoid(targetPlayer)
-    local root = getRoot(targetPlayer)
 
-    return humanoid and humanoid.Health > 0 and root
+    return humanoid ~= nil and humanoid.Health > 0
 end
 
 local function getRemote()
@@ -122,15 +129,18 @@ local function getToolNames()
         return toolNames
     end
 
+    -- Do not sort: the Backpack order is used for the fourth move.
     for _, item in ipairs(backpack:GetChildren()) do
         if item:IsA("Tool") then
             table.insert(toolNames, item.Name)
         end
     end
 
-    table.sort(toolNames)
-
     return toolNames
+end
+
+local function getToolSignature(toolNames)
+    return table.concat(toolNames, "\31")
 end
 
 local function findTool(toolName)
@@ -148,6 +158,20 @@ local function findTool(toolName)
     end
 
     return nil
+end
+
+local function containsTool(toolNames, targetName)
+    for _, toolName in ipairs(toolNames) do
+        if toolName == targetName then
+            return true
+        end
+    end
+
+    return false
+end
+
+local function isPaused()
+    return os.clock() < pauseUntil
 end
 
 local function stopOrbit()
@@ -177,6 +201,7 @@ end
 
 local function canAttack(session, target)
     return isSessionActive(session)
+        and not isPaused()
         and target
         and isAlive(player)
         and isAlive(target)
@@ -211,22 +236,23 @@ local function startOrbit(target, session)
 
         angle = angle + ORBIT_SPEED * deltaTime
 
-        -- Predict slightly ahead based on horizontal movement.
         local velocity = targetRoot.AssemblyLinearVelocity
         local horizontalVelocity = Vector3.new(velocity.X, 0, velocity.Z)
-        local predictedTargetPosition = targetRoot.Position
-            + horizontalVelocity * FOLLOW_PREDICTION
+        local lead = horizontalVelocity * FOLLOW_PREDICTION
 
-        local orbitPosition = predictedTargetPosition + Vector3.new(
+        if lead.Magnitude > MAX_FOLLOW_LEAD then
+            lead = lead.Unit * MAX_FOLLOW_LEAD
+        end
+
+        local predictedPosition = targetRoot.Position + lead
+
+        local orbitPosition = predictedPosition + Vector3.new(
             math.cos(angle) * ORBIT_RADIUS,
             ORBIT_HEIGHT,
             math.sin(angle) * ORBIT_RADIUS
         )
 
-        myRoot.CFrame = CFrame.lookAt(
-            orbitPosition,
-            predictedTargetPosition
-        )
+        myRoot.CFrame = CFrame.lookAt(orbitPosition, predictedPosition)
     end)
 end
 
@@ -299,6 +325,78 @@ local function doComboRound(session, target)
     end
 end
 
+local function pressG()
+    local remote = getRemote()
+
+    if not remote then
+        warn("Communicate remote was not found.")
+        return
+    end
+
+    -- Snapshot current moves before the ultimate changes their names.
+    lastToolSignature = getToolSignature(getToolNames())
+
+    -- Pause both attacks and orbit movement for 0.5 seconds.
+    pauseUntil = os.clock() + G_PAUSE_DURATION
+    stopOrbit()
+
+    remote:FireServer({
+        Key = Enum.KeyCode.G,
+        MoveDirection = Vector3.new(0, 0, 0),
+        Goal = "KeyPress",
+        MousePos = CFrame.new(
+            -138.00552368164,
+            437.50628662109,
+            78.483154296875,
+            0.18005938827991,
+            0.15804965794086,
+            -0.9708753824234,
+            0,
+            0.98700731992722,
+            0.16067577898502,
+            0.98365581035614,
+            -0.028931181877851,
+            0.17771992087364
+        ),
+    })
+
+    remote:FireServer({
+        Goal = "KeyRelease",
+        Key = Enum.KeyCode.G,
+    })
+end
+
+local function handleMoveNameChange(session, target, toolNames)
+    if containsTool(toolNames, "Death Counter") then
+        -- Saitama: use the fourth Backpack move after the ultimate changes moves.
+        local fourthMove = toolNames[4]
+
+        if fourthMove then
+            fireMove(fourthMove, session, target)
+        end
+    else
+        -- Other characters: one normal M1 sequence, then resume the normal loop.
+        doM1(session, target)
+    end
+end
+
+local function checkForMoveNameChange(session, target)
+    local toolNames = getToolNames()
+    local signature = getToolSignature(toolNames)
+
+    if not lastToolSignature then
+        lastToolSignature = signature
+        return
+    end
+
+    if signature == lastToolSignature then
+        return
+    end
+
+    lastToolSignature = signature
+    handleMoveNameChange(session, target, toolNames)
+end
+
 local function stopCombo()
     comboEnabled = false
     comboSession = comboSession + 1
@@ -309,7 +407,7 @@ local function startCombo()
     local target = getSelectedTarget()
 
     if not target or target == player then
-        warn("Select a valid target.")
+        warn("Select a valid target first.")
         return
     end
 
@@ -317,17 +415,26 @@ local function startCombo()
     comboSession = comboSession + 1
 
     local session = comboSession
+    lastToolSignature = getToolSignature(getToolNames())
 
     task.spawn(function()
         while isSessionActive(session) do
             target = getSelectedTarget()
 
-            if target and isAlive(player) and isAlive(target) then
+            if isPaused() then
+                stopOrbit()
+                task.wait(PAUSE_CHECK_DELAY)
+            elseif target and isAlive(player) and isAlive(target) then
                 startOrbit(target, session)
-                doComboRound(session, target)
+                checkForMoveNameChange(session, target)
+
+                if canAttack(session, target) then
+                    doComboRound(session, target)
+                end
+
                 task.wait(TIME_BETWEEN_ROUNDS)
             else
-                -- Keep the UI and toggle enabled; simply wait for respawn.
+                -- A death pauses the script but does not switch the UI toggle off.
                 stopOrbit()
                 task.wait(PAUSE_CHECK_DELAY)
             end
@@ -354,8 +461,8 @@ end
 local Window = WindUI:CreateWindow({
     Title = "Combat Test",
     Icon = "crosshair",
-    Size = UDim2.fromOffset(420, 245),
-    MinSize = Vector2.new(420, 245),
+    Size = UDim2.fromOffset(420, 280),
+    MinSize = Vector2.new(420, 280),
     Theme = "Dark",
     Transparent = true,
     Resizable = false,
@@ -368,25 +475,22 @@ local Tab = Window:Tab({
 })
 
 local playerNames = getPlayerNames()
+selectedTargetName = playerNames[1]
 
 local targetDropdown = Tab:Dropdown({
     Title = "Target player",
     Values = playerNames,
-    Value = playerNames[1],
+    Value = selectedTargetName,
     Multi = false,
     AllowNone = true,
     Callback = function(playerName)
         selectedTargetName = playerName
 
         if comboEnabled then
-            comboSession = comboSession + 1
-            stopOrbit()
             startCombo()
         end
     end,
 })
-
-selectedTargetName = playerNames[1]
 
 Tab:Button({
     Title = "Refresh players",
@@ -407,6 +511,13 @@ Tab:Button({
     end,
 })
 
+Tab:Button({
+    Title = "Activate G",
+    Callback = function()
+        pressG()
+    end,
+})
+
 Tab:Toggle({
     Title = "Combo attack",
     Value = false,
@@ -418,6 +529,38 @@ Tab:Toggle({
         end
     end,
 })
+
+-- Persistent Open UI button: survives minimising and local-character respawns.
+local reopenGui = Instance.new("ScreenGui")
+reopenGui.Name = "CombatTestReopen"
+reopenGui.ResetOnSpawn = false
+reopenGui.IgnoreGuiInset = true
+reopenGui.Parent = player:WaitForChild("PlayerGui")
+
+local reopenButton = Instance.new("TextButton")
+reopenButton.Name = "OpenButton"
+reopenButton.AnchorPoint = Vector2.new(1, 0)
+reopenButton.Position = UDim2.new(1, -16, 0, 72)
+reopenButton.Size = UDim2.fromOffset(105, 34)
+reopenButton.BackgroundColor3 = Color3.fromRGB(35, 35, 42)
+reopenButton.BorderSizePixel = 0
+reopenButton.Text = "Open UI"
+reopenButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+reopenButton.TextSize = 14
+reopenButton.Font = Enum.Font.GothamMedium
+reopenButton.Parent = reopenGui
+
+local corner = Instance.new("UICorner")
+corner.CornerRadius = UDim.new(0, 7)
+corner.Parent = reopenButton
+
+reopenButton.Activated:Connect(function()
+    if type(Window.Open) == "function" then
+        Window:Open()
+    elseif type(Window.Toggle) == "function" then
+        Window:Toggle()
+    end
+end)
 
 Players.PlayerRemoving:Connect(function(leavingPlayer)
     if leavingPlayer.Name == selectedTargetName then
