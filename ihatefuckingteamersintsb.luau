@@ -71,10 +71,12 @@ local ORBIT_SPEED = 4
 local FOLLOW_PREDICTION = 0.18
 local MAX_FOLLOW_LEAD = 12
 
-local TIME_BETWEEN_M1S = 0.18
-local TIME_BETWEEN_TOOLS = 0.45
-local TIME_BETWEEN_ROUNDS = 0.75
-local PAUSE_CHECK_DELAY = 0.15
+local M1_DELAY = 0.18
+local TOOL_DELAY = 0.45
+local ROUND_DELAY = 0.75
+local PAUSE_CHECK_DELAY = 0.1
+
+local G_REPEAT_INTERVAL = 2
 local G_PAUSE_DURATION = 0.5
 
 local function getCharacter(targetPlayer)
@@ -123,20 +125,20 @@ end
 
 local function getToolNames()
     local backpack = player:FindFirstChild("Backpack")
-    local toolNames = {}
+    local names = {}
 
     if not backpack then
-        return toolNames
+        return names
     end
 
-    -- Do not sort: the Backpack order is used for the fourth move.
+    -- Keep Backpack order: index 4 is treated as the fourth move.
     for _, item in ipairs(backpack:GetChildren()) do
         if item:IsA("Tool") then
-            table.insert(toolNames, item.Name)
+            table.insert(names, item.Name)
         end
     end
 
-    return toolNames
+    return names
 end
 
 local function getToolSignature(toolNames)
@@ -158,16 +160,6 @@ local function findTool(toolName)
     end
 
     return nil
-end
-
-local function containsTool(toolNames, targetName)
-    for _, toolName in ipairs(toolNames) do
-        if toolName == targetName then
-            return true
-        end
-    end
-
-    return false
 end
 
 local function isPaused()
@@ -244,15 +236,18 @@ local function startOrbit(target, session)
             lead = lead.Unit * MAX_FOLLOW_LEAD
         end
 
-        local predictedPosition = targetRoot.Position + lead
+        local predictedTargetPosition = targetRoot.Position + lead
 
-        local orbitPosition = predictedPosition + Vector3.new(
+        local orbitPosition = predictedTargetPosition + Vector3.new(
             math.cos(angle) * ORBIT_RADIUS,
             ORBIT_HEIGHT,
             math.sin(angle) * ORBIT_RADIUS
         )
 
-        myRoot.CFrame = CFrame.lookAt(orbitPosition, predictedPosition)
+        myRoot.CFrame = CFrame.lookAt(
+            orbitPosition,
+            predictedTargetPosition
+        )
     end)
 end
 
@@ -278,7 +273,7 @@ local function doM1(session, target)
             Goal = "LeftClickRelease",
         })
 
-        task.wait(TIME_BETWEEN_M1S)
+        task.wait(M1_DELAY)
     end
 
     return true
@@ -320,7 +315,7 @@ local function doComboRound(session, target)
         end
 
         if index < toolCount then
-            task.wait(TIME_BETWEEN_TOOLS)
+            task.wait(TOOL_DELAY)
         end
     end
 end
@@ -329,14 +324,13 @@ local function pressG()
     local remote = getRemote()
 
     if not remote then
-        warn("Communicate remote was not found.")
         return
     end
 
-    -- Snapshot current moves before the ultimate changes their names.
+    -- Store the normal move names before the ultimate changes them.
     lastToolSignature = getToolSignature(getToolNames())
 
-    -- Pause both attacks and orbit movement for 0.5 seconds.
+    -- Absolutely no attacks or orbit movement during this window.
     pauseUntil = os.clock() + G_PAUSE_DURATION
     stopOrbit()
 
@@ -366,35 +360,32 @@ local function pressG()
     })
 end
 
-local function handleMoveNameChange(session, target, toolNames)
-    if containsTool(toolNames, "Death Counter") then
-        -- Saitama: use the fourth Backpack move after the ultimate changes moves.
-        local fourthMove = toolNames[4]
-
-        if fourthMove then
-            fireMove(fourthMove, session, target)
-        end
-    else
-        -- Other characters: one normal M1 sequence, then resume the normal loop.
-        doM1(session, target)
-    end
-end
-
-local function checkForMoveNameChange(session, target)
+local function checkForUltimate()
     local toolNames = getToolNames()
-    local signature = getToolSignature(toolNames)
+    local newSignature = getToolSignature(toolNames)
 
     if not lastToolSignature then
-        lastToolSignature = signature
-        return
+        lastToolSignature = newSignature
+        return nil
     end
 
-    if signature == lastToolSignature then
-        return
+    if newSignature == lastToolSignature then
+        return nil
     end
 
-    lastToolSignature = signature
-    handleMoveNameChange(session, target, toolNames)
+    lastToolSignature = newSignature
+
+    return toolNames
+end
+
+local function useUltimateFourthMove(session, target, toolNames)
+    stopOrbit()
+
+    local fourthMove = toolNames[4]
+
+    if fourthMove then
+        fireMove(fourthMove, session, target)
+    end
 end
 
 local function stopCombo()
@@ -407,7 +398,7 @@ local function startCombo()
     local target = getSelectedTarget()
 
     if not target or target == player then
-        warn("Select a valid target first.")
+        warn("Select a valid target.")
         return
     end
 
@@ -417,6 +408,19 @@ local function startCombo()
     local session = comboSession
     lastToolSignature = getToolSignature(getToolNames())
 
+    -- Automatic G presses while the combo is enabled.
+    task.spawn(function()
+        while isSessionActive(session) do
+            target = getSelectedTarget()
+
+            if target and isAlive(player) and isAlive(target) and not isPaused() then
+                pressG()
+            end
+
+            task.wait(G_REPEAT_INTERVAL)
+        end
+    end)
+
     task.spawn(function()
         while isSessionActive(session) do
             target = getSelectedTarget()
@@ -424,17 +428,24 @@ local function startCombo()
             if isPaused() then
                 stopOrbit()
                 task.wait(PAUSE_CHECK_DELAY)
+
             elseif target and isAlive(player) and isAlive(target) then
                 startOrbit(target, session)
-                checkForMoveNameChange(session, target)
 
-                if canAttack(session, target) then
+                -- Any Backpack move-name change means ultimate mode.
+                local ultimateTools = checkForUltimate()
+
+                if ultimateTools then
+                    useUltimateFourthMove(session, target, ultimateTools)
+                    task.wait(ROUND_DELAY)
+
+                elseif canAttack(session, target) then
                     doComboRound(session, target)
+                    task.wait(ROUND_DELAY)
                 end
 
-                task.wait(TIME_BETWEEN_ROUNDS)
             else
-                -- A death pauses the script but does not switch the UI toggle off.
+                -- Death pauses, but never disables the combo toggle.
                 stopOrbit()
                 task.wait(PAUSE_CHECK_DELAY)
             end
@@ -461,8 +472,8 @@ end
 local Window = WindUI:CreateWindow({
     Title = "Combat Test",
     Icon = "crosshair",
-    Size = UDim2.fromOffset(420, 280),
-    MinSize = Vector2.new(420, 280),
+    Size = UDim2.fromOffset(420, 245),
+    MinSize = Vector2.new(420, 245),
     Theme = "Dark",
     Transparent = true,
     Resizable = false,
@@ -511,13 +522,6 @@ Tab:Button({
     end,
 })
 
-Tab:Button({
-    Title = "Activate G",
-    Callback = function()
-        pressG()
-    end,
-})
-
 Tab:Toggle({
     Title = "Combo attack",
     Value = false,
@@ -530,15 +534,20 @@ Tab:Toggle({
     end,
 })
 
--- Persistent Open UI button: survives minimising and local-character respawns.
+local playerGui = player:WaitForChild("PlayerGui")
+local existingReopenGui = playerGui:FindFirstChild("CombatTestReopen")
+
+if existingReopenGui then
+    existingReopenGui:Destroy()
+end
+
 local reopenGui = Instance.new("ScreenGui")
 reopenGui.Name = "CombatTestReopen"
 reopenGui.ResetOnSpawn = false
 reopenGui.IgnoreGuiInset = true
-reopenGui.Parent = player:WaitForChild("PlayerGui")
+reopenGui.Parent = playerGui
 
 local reopenButton = Instance.new("TextButton")
-reopenButton.Name = "OpenButton"
 reopenButton.AnchorPoint = Vector2.new(1, 0)
 reopenButton.Position = UDim2.new(1, -16, 0, 72)
 reopenButton.Size = UDim2.fromOffset(105, 34)
@@ -550,9 +559,9 @@ reopenButton.TextSize = 14
 reopenButton.Font = Enum.Font.GothamMedium
 reopenButton.Parent = reopenGui
 
-local corner = Instance.new("UICorner")
-corner.CornerRadius = UDim.new(0, 7)
-corner.Parent = reopenButton
+local reopenCorner = Instance.new("UICorner")
+reopenCorner.CornerRadius = UDim.new(0, 7)
+reopenCorner.Parent = reopenButton
 
 reopenButton.Activated:Connect(function()
     if type(Window.Open) == "function" then
