@@ -63,7 +63,9 @@ local oldPlatformStand = false
 local angle = 0
 
 local lastToolSignature = nil
-local pauseUntil = 0
+local attackPauseUntil = 0
+local ultimateQueued = false
+local ultimateIgnoreUntil = 0
 
 local ORBIT_RADIUS = 3
 local ORBIT_HEIGHT = -6
@@ -74,10 +76,11 @@ local MAX_FOLLOW_LEAD = 12
 local M1_DELAY = 0.18
 local TOOL_DELAY = 0.45
 local ROUND_DELAY = 0.75
-local PAUSE_CHECK_DELAY = 0.1
+local DEAD_CHECK_DELAY = 0.2
 
 local G_REPEAT_INTERVAL = 2
-local G_PAUSE_DURATION = 0.5
+local ULTIMATE_ATTACK_PAUSE = 0.5
+local TOOL_CHECK_INTERVAL = 0.1
 
 local function getCharacter(targetPlayer)
     if not targetPlayer then
@@ -131,7 +134,7 @@ local function getToolNames()
         return names
     end
 
-    -- Keep Backpack order: index 4 is treated as the fourth move.
+    -- Keep the Backpack order: index 4 is the fourth move.
     for _, item in ipairs(backpack:GetChildren()) do
         if item:IsA("Tool") then
             table.insert(names, item.Name)
@@ -162,10 +165,6 @@ local function findTool(toolName)
     return nil
 end
 
-local function isPaused()
-    return os.clock() < pauseUntil
-end
-
 local function stopOrbit()
     if orbitConnection then
         orbitConnection:Disconnect()
@@ -191,12 +190,19 @@ local function isSessionActive(session)
     return comboEnabled and comboSession == session
 end
 
-local function canAttack(session, target)
+local function canOrbit(session, target)
     return isSessionActive(session)
-        and not isPaused()
         and target
         and isAlive(player)
         and isAlive(target)
+end
+
+local function attacksPaused()
+    return os.clock() < attackPauseUntil
+end
+
+local function canAttack(session, target)
+    return canOrbit(session, target) and not attacksPaused()
 end
 
 local function startOrbit(target, session)
@@ -213,7 +219,8 @@ local function startOrbit(target, session)
     end
 
     orbitConnection = RunService.RenderStepped:Connect(function(deltaTime)
-        if not canAttack(session, target) then
+        -- Attack pauses intentionally do not affect orbit movement.
+        if not canOrbit(session, target) then
             stopOrbit()
             return
         end
@@ -327,13 +334,6 @@ local function pressG()
         return
     end
 
-    -- Store the normal move names before the ultimate changes them.
-    lastToolSignature = getToolSignature(getToolNames())
-
-    -- Absolutely no attacks or orbit movement during this window.
-    pauseUntil = os.clock() + G_PAUSE_DURATION
-    stopOrbit()
-
     remote:FireServer({
         Key = Enum.KeyCode.G,
         MoveDirection = Vector3.new(0, 0, 0),
@@ -360,37 +360,63 @@ local function pressG()
     })
 end
 
-local function checkForUltimate()
-    local toolNames = getToolNames()
-    local newSignature = getToolSignature(toolNames)
-
-    if not lastToolSignature then
-        lastToolSignature = newSignature
-        return nil
+local function queueUltimateFourthMove(session)
+    if ultimateQueued then
+        return
     end
 
-    if newSignature == lastToolSignature then
-        return nil
-    end
+    ultimateQueued = true
 
-    lastToolSignature = newSignature
+    -- Pause attacks only. Orbit continues normally.
+    attackPauseUntil = os.clock() + ULTIMATE_ATTACK_PAUSE
 
-    return toolNames
+    task.spawn(function()
+        while os.clock() < attackPauseUntil do
+            task.wait(0.05)
+        end
+
+        local target = getSelectedTarget()
+        local toolNames = getToolNames()
+        local fourthMove = toolNames[4]
+
+        if fourthMove and canAttack(session, target) then
+            fireMove(fourthMove, session, target)
+        end
+
+        -- Ignore brief post-move Backpack changes.
+        ultimateIgnoreUntil = os.clock() + 0.5
+        lastToolSignature = getToolSignature(getToolNames())
+        ultimateQueued = false
+    end)
 end
 
-local function useUltimateFourthMove(session, target, toolNames)
-    stopOrbit()
+local function watchForUltimate(session)
+    task.spawn(function()
+        while isSessionActive(session) do
+            local toolNames = getToolNames()
+            local signature = getToolSignature(toolNames)
 
-    local fourthMove = toolNames[4]
+            if not lastToolSignature then
+                lastToolSignature = signature
 
-    if fourthMove then
-        fireMove(fourthMove, session, target)
-    end
+            elseif signature ~= lastToolSignature then
+                lastToolSignature = signature
+
+                if os.clock() >= ultimateIgnoreUntil and #toolNames >= 4 then
+                    queueUltimateFourthMove(session)
+                end
+            end
+
+            task.wait(TOOL_CHECK_INTERVAL)
+        end
+    end)
 end
 
 local function stopCombo()
     comboEnabled = false
     comboSession = comboSession + 1
+    attackPauseUntil = 0
+    ultimateQueued = false
     stopOrbit()
 end
 
@@ -406,14 +432,17 @@ local function startCombo()
     comboSession = comboSession + 1
 
     local session = comboSession
-    lastToolSignature = getToolSignature(getToolNames())
 
-    -- Automatic G presses while the combo is enabled.
+    lastToolSignature = getToolSignature(getToolNames())
+    attackPauseUntil = 0
+    ultimateQueued = false
+
+    -- Continuously attempts G without interrupting attacks or orbit.
     task.spawn(function()
         while isSessionActive(session) do
             target = getSelectedTarget()
 
-            if target and isAlive(player) and isAlive(target) and not isPaused() then
+            if target and isAlive(player) and isAlive(target) then
                 pressG()
             end
 
@@ -421,33 +450,25 @@ local function startCombo()
         end
     end)
 
+    watchForUltimate(session)
+
     task.spawn(function()
         while isSessionActive(session) do
             target = getSelectedTarget()
 
-            if isPaused() then
-                stopOrbit()
-                task.wait(PAUSE_CHECK_DELAY)
-
-            elseif target and isAlive(player) and isAlive(target) then
+            if target and isAlive(player) and isAlive(target) then
                 startOrbit(target, session)
 
-                -- Any Backpack move-name change means ultimate mode.
-                local ultimateTools = checkForUltimate()
-
-                if ultimateTools then
-                    useUltimateFourthMove(session, target, ultimateTools)
-                    task.wait(ROUND_DELAY)
-
-                elseif canAttack(session, target) then
+                if attacksPaused() then
+                    task.wait(0.05)
+                else
                     doComboRound(session, target)
                     task.wait(ROUND_DELAY)
                 end
-
             else
-                -- Death pauses, but never disables the combo toggle.
+                -- Death pauses only. The UI toggle remains on.
                 stopOrbit()
-                task.wait(PAUSE_CHECK_DELAY)
+                task.wait(DEAD_CHECK_DELAY)
             end
         end
 
@@ -535,10 +556,10 @@ Tab:Toggle({
 })
 
 local playerGui = player:WaitForChild("PlayerGui")
-local existingReopenGui = playerGui:FindFirstChild("CombatTestReopen")
+local existingGui = playerGui:FindFirstChild("CombatTestReopen")
 
-if existingReopenGui then
-    existingReopenGui:Destroy()
+if existingGui then
+    existingGui:Destroy()
 end
 
 local reopenGui = Instance.new("ScreenGui")
@@ -559,9 +580,9 @@ reopenButton.TextSize = 14
 reopenButton.Font = Enum.Font.GothamMedium
 reopenButton.Parent = reopenGui
 
-local reopenCorner = Instance.new("UICorner")
-reopenCorner.CornerRadius = UDim.new(0, 7)
-reopenCorner.Parent = reopenButton
+local corner = Instance.new("UICorner")
+corner.CornerRadius = UDim.new(0, 7)
+corner.Parent = reopenButton
 
 reopenButton.Activated:Connect(function()
     if type(Window.Open) == "function" then
