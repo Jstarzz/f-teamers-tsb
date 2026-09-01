@@ -101,12 +101,17 @@ local surfacePosition: Vector3? = nil
 local comboWasOn = false
 local standResumeAction: string? = nil
 
--- Auto-block (F hold), ESP, speed boost
+-- Auto-block (only while the target is swinging), no lag, speed, noclip
 local autoBlockEnabled = false
 local blockHeld = false
-local espEnabled = false
 local speedBoostEnabled = false
 local baseWalkSpeed: number? = nil
+local noLagEnabled = true        -- periodic client-side cleanup sweeps
+local noclipEnabled = false      -- client-side walk through walls
+local noclipParts: { [BasePart]: boolean } = {}
+local downsThisSession = 0       -- downs during the current combo session
+local downTrackedByTarget: { [string]: number } = {}
+local lastTargetAttack: { [string]: number } = {}
 
 -- Stand system
 local standEnabled = false
@@ -144,7 +149,8 @@ local rSpamToggle: any = nil
 local qSpamToggle: any = nil
 local hideToggle: any = nil
 local blockToggle: any = nil
-local espToggle: any = nil
+local noLagToggle: any = nil
+local noclipToggle: any = nil
 local speedToggle: any = nil
 local silentToggle: any = nil
 local smartToggle: any = nil
@@ -211,9 +217,10 @@ local LOW_HP_RECOVER = 90
 local HIDE_DEPTH = -250
 local HIDE_CHECK_DELAY = 0.3
 
--- Auto-block: hold F (block) whenever the target is this close.
+-- Auto-block: hold F only when the target is close AND swinging.
 local BLOCK_KEY = Enum.KeyCode.F
 local BLOCK_RANGE = 12
+local BLOCK_LINGER = 0.25 -- keep blocking briefly after their swing ends
 local BLOCK_CHECK_DELAY = 0.1
 
 -- Smart attacking: never swing from outside melee range, and give
@@ -240,9 +247,11 @@ local LETHAL_CANCEL_DIST = 2.2
 local LETHAL_TIMEOUT = 1.5
 local LETHAL_NOCLIP = true
 
--- ESP / movement
+-- Movement / noclip
 local SPEED_BOOST_VALUE = 64
-local ESP_UPDATE_DELAY = 0.5
+local NOCLIP_RADIUS = 12
+local NOCLIP_SWEEP_DELAY = 0.15
+local LATCH_FEET_OFFSET = 3.2 -- latch hovers at the target's feet
 
 -- Config persistence (executor file APIs)
 local CONFIG_FILE = "tsb_script_config.json"
@@ -300,16 +309,19 @@ local function getRemote(): RemoteEvent?
 end
 
 local function getToolNames()
+    -- Scan the backpack AND the equipped character: tools move between
+    -- them during fights, and missing them means the combo no-ops.
     local backpack = player:FindFirstChild("Backpack")
+    local character = player.Character
     local toolNames = {}
 
-    if not backpack then
-        return toolNames
-    end
-
-    for _, item in ipairs(backpack:GetChildren()) do
-        if item:IsA("Tool") then
-            table.insert(toolNames, item.Name)
+    for _, container in ipairs({ backpack, character }) do
+        if container then
+            for _, item in ipairs(container:GetChildren()) do
+                if item:IsA("Tool") then
+                    table.insert(toolNames, item.Name)
+                end
+            end
         end
     end
 
@@ -343,6 +355,10 @@ end
 -- window after one ends so we don't feed their punish.
 -- ============================================================
 local GUARD_ANIM_PATTERNS = { "block", "guard", "counter", "parry" }
+local ATTACK_ANIM_PATTERNS = {
+    "m1", "punch", "kick", "combo", "attack", "swing", "smash",
+    "elbow", "rush", "upper", "strike", "slap", "blitz",
+}
 
 local function isTargetGuarding(targetPlayer: Player?): boolean
     local character = getCharacter(targetPlayer)
@@ -364,6 +380,36 @@ local function isTargetGuarding(targetPlayer: Player?): boolean
             local name = string.lower(animation.Name)
 
             for _, pattern in ipairs(GUARD_ANIM_PATTERNS) do
+                if string.find(name, pattern, 1, true) then
+                    return true
+                end
+            end
+        end
+    end
+
+    return false
+end
+
+local function isTargetAttacking(targetPlayer: Player?): boolean
+    local character = getCharacter(targetPlayer)
+
+    if not character then
+        return false
+    end
+
+    local animator = character:FindFirstChildOfClass("Animator")
+
+    if not animator then
+        return false
+    end
+
+    for _, track in ipairs(animator:GetPlayingAnimationTracks()) do
+        local animation = track.Animation
+
+        if animation then
+            local name = string.lower(animation.Name)
+
+            for _, pattern in ipairs(ATTACK_ANIM_PATTERNS) do
                 if string.find(name, pattern, 1, true) then
                     return true
                 end
@@ -427,6 +473,20 @@ local function updateSmoothPosition(raw: Vector3, deltaTime: number): Vector3
     smoothTargetPos = smoothTargetPos:Lerp(raw, 1 - math.exp(-SMOOTHING_FACTOR * deltaTime))
 
     return smoothTargetPos
+end
+
+-- Latch position: glued to the target's FEET, not on top of them.
+-- Sitting at ground level under them, tilted up, makes our punches
+-- land on their torso while they struggle to turn their camera.
+local function getLatchFeetPosition(targetRoot: BasePart): Vector3
+    local feetY = targetRoot.Position.Y - LATCH_FEET_OFFSET
+    local ground = workspace:Raycast(targetRoot.Position, Vector3.new(0, -12, 0))
+
+    if ground then
+        feetY = math.max(feetY, ground.Position.Y + 0.5)
+    end
+
+    return Vector3.new(targetRoot.Position.X, feetY, targetRoot.Position.Z)
 end
 
 -- ============================================================
@@ -560,10 +620,13 @@ local function startOrbit(target, session)
         end
 
         if trackingMode == "Latch" then
-            -- Teleport-glued: stay right on top of them every frame.
+            -- Teleport-glued to their FEET: sits under them, angled up,
+            -- so they can't get out of melee range or shake us off.
+            local feetPos = getLatchFeetPosition(targetRoot)
+
             myRoot.CFrame = CFrame.lookAt(
-                targetRoot.Position + Vector3.new(0, 1.2, 0),
-                targetRoot.Position
+                feetPos,
+                targetRoot.Position + Vector3.new(0, 1, 0)
             )
 
             return
@@ -725,15 +788,27 @@ end
 local function doComboRound(session, target)
     local toolNames = getToolNames()
     local toolCount = math.min(#toolNames, 4)
+    -- Always run M1 rounds even when no tools were found, so the
+    -- combo never becomes a silent no-op mid-fight.
+    local rounds = math.max(toolCount, 1)
 
-    for index = 1, toolCount do
+    for index = 1, rounds do
         if not doM1(session, target) then
             return
         end
 
-        -- M1 reset: dash right after the M1 chain so the combo
-        -- never drops, then keep the pressure on.
+        -- M1 reset: face the target, then dash right after the M1
+        -- chain so the combo never drops. The lookAt makes the
+        -- W-dash fly straight at them instead of whatever direction
+        -- we happened to be facing.
         if m1ResetEnabled then
+            local targetRoot = getRoot(target)
+            local myRoot = getRoot(player)
+
+            if targetRoot and myRoot then
+                myRoot.CFrame = CFrame.lookAt(myRoot.Position, targetRoot.Position)
+            end
+
             fireDashRemote()
             task.wait(M1_RESET_DASH_DELAY)
         end
@@ -745,28 +820,26 @@ local function doComboRound(session, target)
             task.wait(0.12)
         end
 
-        if not fireMove(toolNames[index], session, target) then
-            return
-        end
-
-        if index < toolCount then
-            task.wait(getToolDelay(target))
+        if index <= toolCount then
+            if fireMove(toolNames[index], session, target) then
+                if index < toolCount then
+                    task.wait(getToolDelay(target))
+                end
+            else
+                -- Move unavailable: keep the M1 pressure up instead
+                -- of dropping the whole combo.
+                task.wait(getM1Delay(target))
+            end
         end
     end
 end
-
--- Tracks which targets already have kill alerts wired up.
-local killAlerts: { [string]: boolean } = {}
-
--- Assigned later (after the chat helpers exist); notifies + says
--- a line when a combo target dies.
-local alertOnKill: ((targetName: string, target: Player) -> ())? = nil
 
 -- Assigned later too (they use the chat helpers); forward-declared
 -- so the command handler can call them.
 local pullTarget: ((targetName: string) -> ())? = nil
 local saveConfig: (() -> ())? = nil
 local loadConfig: (() -> ())? = nil
+local toggleUiVisibility: (() -> ())? = nil
 
 local function startComboInternal(targetName: string, useOrbit: boolean)
     comboEnabled = true
@@ -779,8 +852,20 @@ local function startComboInternal(targetName: string, useOrbit: boolean)
             local target = Players:FindFirstChild(targetName) :: Player?
 
             if target and isAlive(player) and isAlive(target) then
-                if alertOnKill then
-                    alertOnKill(targetName, target)
+                -- Count a down once per target per session. Local
+                -- counter only: no chat lines, no notifications.
+                if downTrackedByTarget[targetName] ~= session then
+                    downTrackedByTarget[targetName] = session
+
+                    local humanoid = getHumanoid(target)
+
+                    if humanoid then
+                        humanoid.Died:Connect(function()
+                            if isSessionActive(session) then
+                                downsThisSession += 1
+                            end
+                        end)
+                    end
                 end
 
                 -- When the stand is already moving us (latch/annoy/etc),
@@ -806,7 +891,8 @@ end
 local function stopCombo()
     comboEnabled = false
     comboSession = comboSession + 1
-    killAlerts = {}
+    downTrackedByTarget = {}
+    downsThisSession = 0
     stopOrbit()
 end
 
@@ -949,14 +1035,22 @@ local function applyQualitySettings()
     end
 end
 
+-- Sweep once right now (button / .clean). Safe to call anytime.
+local function runCleanupNow()
+    pcall(applyQualitySettings)
+    pcall(cleanupLighting)
+    pcall(cleanupMapEffects)
+end
+
 local function startCleanupLoop()
-    applyQualitySettings()
-    cleanupLighting()
+    runCleanupNow()
 
     task.spawn(function()
         while true do
-            pcall(cleanupMapEffects)
-            pcall(cleanupLighting)
+            if noLagEnabled and not hidden then
+                pcall(cleanupMapEffects)
+                pcall(cleanupLighting)
+            end
 
             task.wait(CLEANUP_INTERVAL)
         end
@@ -994,6 +1088,12 @@ local function standFollowTick()
     local ownerRoot = getRoot(owner)
 
     if not owner or not myRoot or not ownerRoot then
+        return
+    end
+
+    -- If the owner is us, the stand IS our character: teleporting
+    -- "behind ourselves" every frame would just jitter and drift.
+    if owner == player then
         return
     end
 
@@ -1050,9 +1150,11 @@ local function standLatchTick()
         return
     end
 
+    local feetPos = getLatchFeetPosition(targetRoot)
+
     myRoot.CFrame = CFrame.lookAt(
-        targetRoot.Position + Vector3.new(0, 1.2, 0),
-        targetRoot.Position
+        feetPos,
+        targetRoot.Position + Vector3.new(0, 1, 0)
     )
 end
 
@@ -1463,8 +1565,12 @@ local COMMAND_HELP = {
     { ".lethal [on/off|<name>]", "lethal dash (auto / once)" },
     { ".r [on/off]", "toggle R (Burst) spam" },
     { ".q [on/off]", "toggle Q (dash/evade) spam" },
-    { ".f [on/off]", "auto-block when target is close" },
-    { ".esp [on/off]", "see everyone through walls" },
+    { ".f [on/off]", "block while the target is swinging" },
+    { ".nolag [on/off]", "periodic client-side cleanup" },
+    { ".clean", "run the cleanup sweep right now" },
+    { ".noclip [on/off]", "walk through walls (client-side)" },
+    { ".dash", "manual dash toward the target (M1 reset)" },
+    { ".ui", "minimize / restore the UI" },
     { ".speed [on/off|N]", "speed boost (custom N = value)" },
     { ".pull <name>", "yank the target to you + latch" },
     { ".hide [on/off]", "toggle low-HP hide under the map" },
@@ -1749,19 +1855,56 @@ local function handleCommand(message: string, speakerName: string)
         return
     end
 
-    if command == "esp" then
-        local value = string.lower(args[2] or "")
-
-        if value == "off" then
-            espEnabled = false
-        else
-            espEnabled = true
-        end
+    if command == "nolag" then
+        noLagEnabled = string.lower(args[2] or "") ~= "off"
 
         pcall(function()
-            espToggle:Set(espEnabled)
+            noLagToggle:Set(noLagEnabled)
         end)
-        notify("ESP", espEnabled and "ON" or "OFF")
+        notify("No lag", noLagEnabled and "ON (periodic cleanup)" or "OFF")
+
+        if noLagEnabled then
+            runCleanupNow()
+        end
+
+        return
+    end
+
+    if command == "clean" then
+        runCleanupNow()
+        notify("Cleanup", "Effects swept")
+        return
+    end
+
+    if command == "noclip" then
+        noclipEnabled = string.lower(args[2] or "") ~= "off"
+
+        pcall(function()
+            noclipToggle:Set(noclipEnabled)
+        end)
+        notify("Noclip", noclipEnabled and "ON (client-side)" or "OFF")
+        return
+    end
+
+    if command == "dash" then
+        local target = getStandTarget() or getSelectedTarget()
+        local targetRoot = getRoot(target)
+        local myRoot = getRoot(player)
+
+        if targetRoot and myRoot then
+            myRoot.CFrame = CFrame.lookAt(myRoot.Position, targetRoot.Position)
+        end
+
+        fireDashRemote()
+        notify("Dash", "Fired")
+        return
+    end
+
+    if command == "ui" then
+        if toggleUiVisibility then
+            toggleUiVisibility()
+        end
+
         return
     end
 
@@ -2034,34 +2177,11 @@ local function hideLoop()
 end
 
 -- ============================================================
--- Kill alert: when a combo target dies, send a notification and
--- a chat line. Wired once per target per combo session.
--- ============================================================
-alertOnKill = function(targetName: string, target: Player)
-    if killAlerts[targetName] then
-        return
-    end
-
-    local humanoid = getHumanoid(target)
-
-    if not humanoid then
-        return
-    end
-
-    killAlerts[targetName] = true
-
-    humanoid.Died:Connect(function()
-        if comboEnabled then
-            notify("Eliminated", targetName .. " is down")
-            say("[Stand] " .. targetName .. " eliminated")
-        end
-    end)
-end
-
--- ============================================================
--- Auto-block: hold F while the target is close, release when they
--- back off or when disabled. Q-dash spam still works while
--- blocking, so you can block-tank and dash away at the same time.
+-- Auto-block: hold F only while the target is close AND actually
+-- swinging at us. After their attack anim ends we keep blocking
+-- for a short grace window (BLOCK_LINGER) so the guard doesn't
+-- drop mid-swing, then release. We never block people we're
+-- already combo-ing - the guard and the M1 spam fight each other.
 -- ============================================================
 local function updateBlockKey(hold: boolean)
     if hold == blockHeld then
@@ -2079,17 +2199,39 @@ end
 local function autoBlockLoop()
     task.spawn(function()
         while true do
-            if autoBlockEnabled and isAlive(player) then
-                local target = getSelectedTarget()
+            local shouldBlock = false
+
+            if autoBlockEnabled and isAlive(player) and not hidden then
+                local target = getSelectedTarget() or getStandTarget()
                 local myRoot = getRoot(player)
                 local targetRoot = getRoot(target)
+
                 local close = targetRoot and myRoot
                     and (targetRoot.Position - myRoot.Position).Magnitude <= BLOCK_RANGE
 
-                updateBlockKey(close == true)
-            else
-                updateBlockKey(false)
+                if close then
+                    -- Skip the guard while we're already fighting this
+                    -- person: blocking fights the M1 spam.
+                    local fightingThem = target ~= nil
+                        and ((comboEnabled and target == getSelectedTarget())
+                            or (standIsMoving() and target == getStandTarget()))
+
+                    if not fightingThem then
+                        if isTargetAttacking(target) then
+                            if target then
+                                lastTargetAttack[target.Name] = os.clock()
+                            end
+
+                            shouldBlock = true
+                        elseif target and lastTargetAttack[target.Name]
+                            and os.clock() - lastTargetAttack[target.Name] < BLOCK_LINGER then
+                            shouldBlock = true
+                        end
+                    end
+                end
             end
+
+            updateBlockKey(shouldBlock)
 
             task.wait(BLOCK_CHECK_DELAY)
         end
@@ -2126,93 +2268,6 @@ local function ultLoop()
 end
 
 -- ============================================================
--- ESP: client-only name + HP tags and glowing outlines for every
--- other player. Instances are created on YOUR client only, so the
--- tags don't replicate to anyone else (safer than painting models).
--- ============================================================
-local function applyEspTo(targetPlayer: Player)
-    pcall(function()
-        local character = targetPlayer.Character
-
-        if not character then
-            return
-        end
-
-        if not character:FindFirstChild("EspHighlight") then
-            local highlight = Instance.new("Highlight")
-            highlight.Name = "EspHighlight"
-            highlight.FillTransparency = 0.9
-            highlight.OutlineColor = Color3.new(1, 0.15, 0.15)
-            highlight.Parent = character
-        end
-
-        local head = character:FindFirstChild("Head")
-
-        if head and not head:FindFirstChild("EspTag") then
-            local tag = Instance.new("BillboardGui")
-            tag.Name = "EspTag"
-            tag.AlwaysOnTop = true
-            tag.Size = UDim2.fromOffset(160, 36)
-            tag.Adornee = head
-
-            local label = Instance.new("TextLabel")
-            label.Size = UDim2.fromScale(1, 1)
-            label.BackgroundTransparency = 1
-            label.TextStrokeTransparency = 0
-            label.TextScaled = true
-            label.TextColor3 = Color3.new(1, 0.2, 0.2)
-            label.Text = targetPlayer.Name
-            label.Parent = tag
-
-            tag.Parent = head
-        end
-    end)
-end
-
-local function updateEspTag(targetPlayer: Player)
-    pcall(function()
-        local character = targetPlayer.Character
-
-        if not character then
-            return
-        end
-
-        local head = character:FindFirstChild("Head")
-        local tag = head and head:FindFirstChild("EspTag")
-
-        if not tag or not tag:IsA("BillboardGui") then
-            return
-        end
-
-        local humanoid = getHumanoid(targetPlayer)
-        local hpText = humanoid and tostring(math.floor(humanoid.Health)) or "?"
-
-        local label = tag:FindFirstChildOfClass("TextLabel")
-
-        if label then
-            label.Text = targetPlayer.Name .. " | " .. hpText .. " HP"
-        end
-    end)
-end
-
-local function espLoop()
-    task.spawn(function()
-        while true do
-            if espEnabled then
-                for _, otherPlayer in ipairs(Players:GetPlayers()) do
-                    if otherPlayer ~= player then
-                        applyEspTo(otherPlayer)
-                        updateEspTag(otherPlayer)
-                    end
-                end
-            end
-
-            task.wait(ESP_UPDATE_DELAY)
-        end
-    end)
-end
-
--- ============================================================
 -- Speed boost: bump WalkSpeed while enabled, restore on disable.
 -- (TSB may clamp WalkSpeed server-side; it's pcall'd so it just
 -- silently does nothing on servers that fight it.)
@@ -2241,6 +2296,72 @@ local function speedLoop()
             end
 
             task.wait(0.3)
+        end
+    end)
+end
+
+-- ============================================================
+-- Noclip: walk straight through walls (client-side only). Each
+-- sweep disables collision on anchored geometry around us while
+-- keeping the floor under our feet solid, and everything gets
+-- restored once it leaves our radius or noclip turns off.
+-- ============================================================
+local function noclipSweep()
+    local myRoot = getRoot(player)
+
+    if not myRoot then
+        return
+    end
+
+    local parts = workspace:GetPartBoundsInRadius(myRoot.Position, NOCLIP_RADIUS)
+
+    for _, part in ipairs(parts) do
+        if part.CanCollide and part.Anchored then
+            -- Never touch the floor under our feet or we sink.
+            local partTop = part.Position.Y + part.Size.Y / 2
+
+            if partTop > myRoot.Position.Y - 2.5 then
+                part.CanCollide = false
+                noclipParts[part] = true
+            end
+        end
+    end
+
+    local toRestore = {}
+
+    for part in pairs(noclipParts) do
+        if not part.Parent
+            or (part.Position - myRoot.Position).Magnitude > NOCLIP_RADIUS * 1.5 then
+            table.insert(toRestore, part)
+        end
+    end
+
+    for _, part in ipairs(toRestore) do
+        part.CanCollide = true
+        noclipParts[part] = nil
+    end
+end
+
+local function restoreNoclip()
+    for part in pairs(noclipParts) do
+        pcall(function()
+            part.CanCollide = true
+        end)
+
+        noclipParts[part] = nil
+    end
+end
+
+local function noclipLoop()
+    task.spawn(function()
+        while true do
+            if noclipEnabled and isAlive(player) and not hidden then
+                pcall(noclipSweep)
+            else
+                pcall(restoreNoclip)
+            end
+
+            task.wait(NOCLIP_SWEEP_DELAY)
         end
     end)
 end
@@ -2282,8 +2403,9 @@ local function getConfigData()
         rSpam = rSpamEnabled,
         qSpam = qSpamEnabled,
         autoBlock = autoBlockEnabled,
-        esp = espEnabled,
         speed = speedBoostEnabled,
+        nolag = noLagEnabled,
+        noclip = noclipEnabled,
         hide = hideEnabled,
         silent = silentChat,
         smart = smartAttackEnabled,
@@ -2315,8 +2437,9 @@ local function applyConfig(data: any)
         rSpamEnabled = data.rSpam == true
         qSpamEnabled = data.qSpam == true
         autoBlockEnabled = data.autoBlock == true
-        espEnabled = data.esp == true
         speedBoostEnabled = data.speed == true
+        noLagEnabled = data.nolag ~= false
+        noclipEnabled = data.noclip == true
         hideEnabled = data.hide ~= false
         silentChat = data.silent ~= false
         smartAttackEnabled = data.smart ~= false
@@ -2333,7 +2456,8 @@ local function applyConfig(data: any)
         rSpamToggle:Set(rSpamEnabled)
         qSpamToggle:Set(qSpamEnabled)
         blockToggle:Set(autoBlockEnabled)
-        espToggle:Set(espEnabled)
+        noLagToggle:Set(noLagEnabled)
+        noclipToggle:Set(noclipEnabled)
         speedToggle:Set(speedBoostEnabled)
         hideToggle:Set(hideEnabled)
         silentToggle:Set(silentChat)
@@ -2406,13 +2530,96 @@ end
 local Window = WindUI:CreateWindow({
     Title = "Combat Test",
     Icon = "crosshair",
-    Size = UDim2.fromOffset(420, 245),
-    MinSize = Vector2.new(420, 245),
+    Size = UDim2.fromOffset(440, 400),
+    MinSize = Vector2.new(440, 260),
     Theme = "Dark",
     Transparent = true,
     Resizable = false,
+    ScrollBarEnabled = true, -- content overflows: keep every toggle reachable
     ToggleKey = Enum.KeyCode.RightShift,
 })
+
+-- ------------------------------------------------------------
+-- Minimize / restore support
+-- The WindUI topbar minimize button closes the window, but on PC
+-- its floating "open" button is never shown - so we roll our own:
+-- a tiny corner button that reappears whenever the UI is closed.
+-- RightShift (ToggleKey) and .ui restore it too.
+-- ------------------------------------------------------------
+local uiOpen = true
+local uiOpenButton: TextButton? = nil
+
+local function updateOpenButton()
+    if not uiOpenButton then
+        return
+    end
+
+    pcall(function()
+        uiOpenButton.Visible = not uiOpen
+    end)
+end
+
+toggleUiVisibility = function()
+    local winAny = Window :: any
+
+    pcall(function()
+        if uiOpen then
+            winAny:Close()
+        else
+            winAny:Open()
+        end
+    end)
+end
+
+-- Keep our restore button in sync even when the window is closed
+-- through WindUI's own topbar minimize button.
+pcall(function()
+    local winAny = Window :: any
+
+    winAny:OnClose(function()
+        uiOpen = false
+        updateOpenButton()
+    end)
+
+    winAny:OnOpen(function()
+        uiOpen = true
+        updateOpenButton()
+    end)
+end)
+
+-- The restore button itself: a small always-clickable corner button
+-- in its own ScreenGui, shown only while the window is hidden.
+task.spawn(function()
+    local playerGui = player:WaitForChild("PlayerGui")
+
+    local gui = Instance.new("ScreenGui")
+    gui.Name = "FreebuffUiRestore"
+    gui.ResetOnSpawn = false
+    gui.IgnoreGuiInset = true
+    gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    gui.Parent = playerGui
+
+    local button = Instance.new("TextButton")
+    button.Name = "RestoreButton"
+    button.Size = UDim2.fromOffset(44, 44)
+    button.Position = UDim2.new(1, -54, 1, -54)
+    button.BackgroundColor3 = Color3.fromRGB(40, 40, 46)
+    button.BackgroundTransparency = 0.1
+    button.Text = "UI"
+    button.TextColor3 = Color3.new(1, 1, 1)
+    button.Font = Enum.Font.GothamBold
+    button.TextScaled = true
+    button.Parent = gui
+
+    uiOpenButton = button
+    updateOpenButton()
+
+    button.Activated:Connect(function()
+        if toggleUiVisibility then
+            toggleUiVisibility()
+        end
+    end)
+end)
 
 -- ------------------------------------------------------------
 -- Target tab (combo engine)
@@ -2505,19 +2712,38 @@ blockToggle = Tab:Toggle({
     end,
 })
 
-espToggle = Tab:Toggle({
-    Title = "ESP (see players through walls)",
-    Value = false,
-    Callback = function(enabled)
-        espEnabled = enabled
-    end,
-})
-
 speedToggle = Tab:Toggle({
     Title = "Speed boost",
     Value = false,
     Callback = function(enabled)
         speedBoostEnabled = enabled
+    end,
+})
+
+noLagToggle = Tab:Toggle({
+    Title = "No lag (periodic cleanup)",
+    Value = noLagEnabled,
+    Callback = function(enabled)
+        noLagEnabled = enabled
+
+        if enabled then
+            runCleanupNow()
+        end
+    end,
+})
+
+Tab:Button({
+    Title = "Cleanup now (kill map effects)",
+    Callback = function()
+        runCleanupNow()
+    end,
+})
+
+noclipToggle = Tab:Toggle({
+    Title = "Noclip (walk through walls)",
+    Value = false,
+    Callback = function(enabled)
+        noclipEnabled = enabled
     end,
 })
 
@@ -2790,6 +3016,30 @@ StandTab:Button({
     end,
 })
 
+StandTab:Button({
+    Title = "Dash now (M1 reset)",
+    Callback = function()
+        local target = getStandTarget() or getSelectedTarget()
+        local targetRoot = getRoot(target)
+        local myRoot = getRoot(player)
+
+        if targetRoot and myRoot then
+            myRoot.CFrame = CFrame.lookAt(myRoot.Position, targetRoot.Position)
+        end
+
+        fireDashRemote()
+    end,
+})
+
+StandTab:Button({
+    Title = "Minimize UI (RightShift / .ui reopens)",
+    Callback = function()
+        if toggleUiVisibility then
+            toggleUiVisibility()
+        end
+    end,
+})
+
 local standStatusLabel = StandTab:Label({
     Text = "Stand: off",
 })
@@ -2871,7 +3121,8 @@ task.spawn(function()
 
                 setStatus(selectedTargetName .. ": HP " .. hpText
                     .. " | " .. distanceText .. " studs | "
-                    .. trackingMode .. " (" .. comboText .. ")")
+                    .. trackingMode .. " (" .. comboText .. ")"
+                    .. " | Downs: " .. downsThisSession)
             end
         end
 
@@ -2891,6 +3142,7 @@ task.spawn(function()
             standStatusLabel:Set("Owner: " .. ownerText
                 .. " | Action: " .. actionText
                 .. " | Target: " .. targetText
+                .. " | Downs: " .. downsThisSession
                 .. " | R: " .. rText .. " Q: " .. qText)
         end)
 
@@ -2912,7 +3164,7 @@ hideLoop()
 autoBlockLoop()
 ultLoop()
 lethalLoop()
-espLoop()
 speedLoop()
+noclipLoop()
 
 Tab:Select()
