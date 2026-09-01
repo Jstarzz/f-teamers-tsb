@@ -37,10 +37,26 @@ if remote then
     })
 end
 ]]--
+-- ============================================================
+-- STAND SYSTEM (JoJo mode)
+-- Your character becomes a Stand for whoever is selected as the
+-- "owner" (any player in the server, or yourself). The owner can
+-- drive you with chat commands: .annoy .fling .latch .carry
+-- .orbit .attack .follow .stop .owner .r .mode .target .help
+-- You (the injector) can always use the commands too, and can
+-- hand the stand off to anyone at any time with .owner <name>.
+-- ============================================================
 local loadOk, WindUI = pcall(function()
-    return loadstring(game:HttpGet(
+    -- (game :: any) keeps strict analysis happy; executors still expose HttpGet.
+    local compiled = loadstring((game :: any):HttpGet(
         "https://github.com/Footagesus/WindUI/releases/latest/download/main.lua"
-    ))()
+    ))
+
+    if not compiled then
+        error("WindUI source failed to compile")
+    end
+
+    return compiled()
 end)
 
 if not loadOk then
@@ -50,47 +66,203 @@ end
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
+local Lighting = game:GetService("Lighting")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local VirtualInputManager = game:GetService("VirtualInputManager")
 
 local player = Players.LocalPlayer
 
-local selectedTargetName = nil
+-- ============================================================
+-- State
+-- ============================================================
+local selectedTargetName: string? = nil
 local comboEnabled = false
 local comboSession = 0
 
-local orbitConnection = nil
-local controlledHumanoid = nil
+local orbitConnection: RBXScriptConnection? = nil
+local controlledHumanoid: Humanoid? = nil
 local oldPlatformStand = false
 local angle = 0
 
-local lastToolSignature = nil
-local attackPauseUntil = 0
-local ultimateQueued = false
-local ultimateIgnoreUntil = 0
+-- Tracking
+local trackingMode = "Orbit" -- "Orbit" (circle strafe) | "Latch" (teleport-glued)
+local smoothTargetPos: Vector3? = nil
 
-local ORBIT_RADIUS = 3
-local ORBIT_HEIGHT = -6
-local ORBIT_SPEED = 4
-local FOLLOW_PREDICTION = 0.18
-local MAX_FOLLOW_LEAD = 12
+-- R spam (Burst key)
+local rSpamEnabled = false
 
-local M1_DELAY = 0.18
-local TOOL_DELAY = 0.45
-local ROUND_DELAY = 0.75
-local DEAD_CHECK_DELAY = 0.2
+-- Q spam (dash key - dashing also cancels ragdoll)
+local qSpamEnabled = false
 
-local G_REPEAT_INTERVAL = 2
-local ULTIMATE_ATTACK_PAUSE = 0.5
-local TOOL_CHECK_INTERVAL = 0.1
+-- Low-HP hide below the map
+local hideEnabled = true
+local hidden = false
+local surfacePosition: Vector3? = nil
+local comboWasOn = false
+local standResumeAction: string? = nil
 
-local function getCharacter(targetPlayer)
-    if not targetPlayer then
-        return nil
-    end
+-- Auto-block (F hold), ESP, speed boost
+local autoBlockEnabled = false
+local blockHeld = false
+local espEnabled = false
+local speedBoostEnabled = false
+local baseWalkSpeed: number? = nil
 
-    return targetPlayer.Character
+-- Stand system
+local standEnabled = false
+local standOwnerName: string? = player.Name
+local standAction = "stop" -- follow | stop | annoy | fling | latch | carry | orbit | attack
+local standTargetName: string? = nil
+local standConnection: RBXScriptConnection? = nil
+local standAngle = 0
+local standBumpTimer = 0
+local platformStandRefs = 0
+
+-- Chat / combat smarts
+local silentChat = true          -- never write chat lines (notifications only)
+local smartAttackEnabled = true  -- avoid swinging into blocks/counters
+local wallComboEnabled = false   -- press Q into walls during combos
+local autoUltEnabled = false     -- tap the ult key while fighting
+local besideFollow = false       -- follow beside the owner, not behind
+local standFollowDist = 3        -- follow distance in studs
+local m1ResetEnabled = true      -- dash after each M1 chain (combo reset)
+local lethalEnabled = false      -- auto lethal dash during fights
+
+-- Lethal dash state
+local lethalExecuting = false
+local lethalNoclipped: { [Instance]: boolean } = {}
+
+-- Guard/counter memory: remembers who just blocked or countered so
+-- the combo engine gives them a grace window before swinging again.
+local lastCounterByTarget: { [string]: number } = {}
+
+-- UI handles (assigned later, referenced by earlier-defined functions)
+local targetDropdown: any = nil
+local trackingDropdown: any = nil
+local ownerDropdown: any = nil
+local rSpamToggle: any = nil
+local qSpamToggle: any = nil
+local hideToggle: any = nil
+local blockToggle: any = nil
+local espToggle: any = nil
+local speedToggle: any = nil
+local silentToggle: any = nil
+local smartToggle: any = nil
+local wallToggle: any = nil
+local ultToggle: any = nil
+local besideToggle: any = nil
+local resetToggle: any = nil
+local lethalToggle: any = nil
+
+-- Stand movement authority: these actions make the stand own our
+-- character's movement, so the combo engine defers to it.
+local STAND_MOVING_ACTIONS = {
+    annoy = true,
+    fling = true,
+    latch = true,
+    carry = true,
+    orbit = true,
+    attack = true,
+}
+
+local function standIsMoving()
+    return standEnabled and (STAND_MOVING_ACTIONS[standAction] == true)
 end
 
-local function getHumanoid(targetPlayer)
+-- ============================================================
+-- Settings
+-- ============================================================
+-- Timing / orbit settings
+local ORBIT_RADIUS = 2.8
+local ORBIT_HEIGHT = -6 -- lower = farther below the target
+local ORBIT_SPEED = 5
+local FOLLOW_PREDICTION = 0.22 -- seconds of velocity prediction
+local MAX_PREDICTION_DIST = 12 -- clamp so prediction never overshoots wildly
+local SMOOTHING_FACTOR = 10    -- higher = snappier smoothing (0 = none)
+local TIME_BETWEEN_M1S = 0.18
+local TIME_BETWEEN_TOOLS = 0.45
+local TIME_BETWEEN_ROUNDS = 0.75
+local PAUSE_CHECK_DELAY = 0.5
+
+-- Finisher speed: when the target's HP is low, attack faster to
+-- secure the kill before they can heal or escape.
+local FINISHER_HP_THRESHOLD = 30
+local TIME_BETWEEN_M1S_FAST = 0.10
+local TIME_BETWEEN_TOOLS_FAST = 0.25
+
+-- R spam. R = Burst in TSB; change the key here if you rebound it.
+local R_SPAM_KEY = Enum.KeyCode.R
+local R_SPAM_INTERVAL = 0.15
+
+-- Q spam. Q = dash in TSB; dashing while ragdolled cancels the ragdoll.
+local Q_SPAM_KEY = Enum.KeyCode.Q
+local Q_SPAM_INTERVAL = 0.12
+
+-- Auto ult. Tapping the ult key with an empty bar is a no-op, so
+-- auto-ult just taps it on an interval while fighting - it only
+-- matters when the bar is actually ready. Change if you rebound it.
+local ULT_KEY = Enum.KeyCode.U
+local ULT_PRESS_INTERVAL = 1.5
+
+-- Low-HP hide: when OUR HP drops low, dip below the map and wait
+-- for regen, then come back and resume. Toggleable (UI / .hide).
+local LOW_HP_THRESHOLD = 30
+local LOW_HP_RECOVER = 90
+local HIDE_DEPTH = -250
+local HIDE_CHECK_DELAY = 0.3
+
+-- Auto-block: hold F (block) whenever the target is this close.
+local BLOCK_KEY = Enum.KeyCode.F
+local BLOCK_RANGE = 12
+local BLOCK_CHECK_DELAY = 0.1
+
+-- Smart attacking: never swing from outside melee range, and give
+-- targets a grace window after they block or counter.
+local SMART_MELEE_RANGE = 14
+local COUNTER_AVOID_TIME = 1.2
+
+-- Wall combos: dash (Q) the target into a wall behind them.
+local WALL_RAY_LENGTH = 30
+local WALL_COMBO_MIN_DIST = 12
+
+-- M1 reset: dash right after each M1 chain so the combo never drops.
+local M1_RESET_DASH_DELAY = 0.12
+
+-- Lethal dash (ported from the loopdash TSB script): vertical pop +
+-- dash into the target while spiraling around them, then hard-cancel.
+local LETHAL_RANGE = 10
+local LETHAL_INTERVAL = 2.5
+local LETHAL_DELAY = 0.232
+local LETHAL_JUMP = 55
+local LETHAL_RADIUS = 15
+local LETHAL_CANCEL_DELAY = 0.4
+local LETHAL_CANCEL_DIST = 2.2
+local LETHAL_TIMEOUT = 1.5
+local LETHAL_NOCLIP = true
+
+-- ESP / movement
+local SPEED_BOOST_VALUE = 64
+local ESP_UPDATE_DELAY = 0.5
+
+-- Config persistence (executor file APIs)
+local CONFIG_FILE = "tsb_script_config.json"
+
+-- Stand behavior
+local STAND_FOLLOW_HEIGHT = 2 -- hovers this high above the owner's feet
+local STAND_ANNOY_RADIUS = 2.2
+local STAND_ANNOY_SPEED = 9
+local STAND_BUMP_INTERVAL = 0.6 -- how often annoy stomps on the victim
+local STAND_CARRY_OFFSET = CFrame.new(0, 3, -2.5) -- held in front of us
+local STAND_FLING_POWER = 120 -- random velocity magnitude per fling frame
+
+-- ============================================================
+-- Character helpers
+-- ============================================================
+local function getCharacter(targetPlayer: Player?)
+    return targetPlayer and targetPlayer.Character
+end
+
+local function getHumanoid(targetPlayer: Player?): Humanoid?
     local character = getCharacter(targetPlayer)
 
     if not character then
@@ -100,55 +272,53 @@ local function getHumanoid(targetPlayer)
     return character:FindFirstChildOfClass("Humanoid")
 end
 
-local function getRoot(targetPlayer)
+local function getRoot(targetPlayer: Player?): BasePart?
     local character = getCharacter(targetPlayer)
 
     if not character then
         return nil
     end
 
-    return character:FindFirstChild("HumanoidRootPart")
+    return character:FindFirstChild("HumanoidRootPart") :: BasePart?
 end
 
 local function isAlive(targetPlayer)
     local humanoid = getHumanoid(targetPlayer)
+    local root = getRoot(targetPlayer)
 
-    return humanoid ~= nil and humanoid.Health > 0
+    return humanoid and humanoid.Health > 0 and root
 end
 
-local function getRemote()
+local function getRemote(): RemoteEvent?
     local character = player.Character
 
     if not character then
         return nil
     end
 
-    return character:FindFirstChild("Communicate")
+    return character:FindFirstChild("Communicate") :: RemoteEvent?
 end
 
 local function getToolNames()
     local backpack = player:FindFirstChild("Backpack")
-    local names = {}
+    local toolNames = {}
 
     if not backpack then
-        return names
+        return toolNames
     end
 
-    -- Keep the Backpack order: index 4 is the fourth move.
     for _, item in ipairs(backpack:GetChildren()) do
         if item:IsA("Tool") then
-            table.insert(names, item.Name)
+            table.insert(toolNames, item.Name)
         end
     end
 
-    return names
+    table.sort(toolNames)
+
+    return toolNames
 end
 
-local function getToolSignature(toolNames)
-    return table.concat(toolNames, "\31")
-end
-
-local function findTool(toolName)
+local function findTool(toolName: string): Tool?
     local backpack = player:FindFirstChild("Backpack")
     local character = player.Character
 
@@ -165,48 +335,108 @@ local function findTool(toolName)
     return nil
 end
 
-local function stopOrbit()
-    if orbitConnection then
-        orbitConnection:Disconnect()
-        orbitConnection = nil
+-- ============================================================
+-- Counter / block detection (pure client-side, no remotes needed)
+-- Other players' animations replicate to us, so their Animator plays
+-- the same tracks our client does. We watch for block, guard, counter
+-- and parry animations and refuse to swing into them, plus a grace
+-- window after one ends so we don't feed their punish.
+-- ============================================================
+local GUARD_ANIM_PATTERNS = { "block", "guard", "counter", "parry" }
+
+local function isTargetGuarding(targetPlayer: Player?): boolean
+    local character = getCharacter(targetPlayer)
+
+    if not character then
+        return false
     end
 
-    if controlledHumanoid and controlledHumanoid.Parent then
-        controlledHumanoid.PlatformStand = oldPlatformStand
+    local animator = character:FindFirstChildOfClass("Animator")
+
+    if not animator then
+        return false
     end
 
-    controlledHumanoid = nil
-end
+    for _, track in ipairs(animator:GetPlayingAnimationTracks()) do
+        local animation = track.Animation
 
-local function getSelectedTarget()
-    if not selectedTargetName then
-        return nil
+        if animation then
+            local name = string.lower(animation.Name)
+
+            for _, pattern in ipairs(GUARD_ANIM_PATTERNS) do
+                if string.find(name, pattern, 1, true) then
+                    return true
+                end
+            end
+        end
     end
 
-    return Players:FindFirstChild(selectedTargetName)
+    return false
 end
 
-local function isSessionActive(session)
-    return comboEnabled and comboSession == session
+local function isTargetCountedRecently(targetPlayer: Player?): boolean
+    if not targetPlayer then
+        return false
+    end
+
+    local lastCounter = lastCounterByTarget[targetPlayer.Name]
+
+    return lastCounter ~= nil and (os.clock() - lastCounter) < COUNTER_AVOID_TIME
 end
 
-local function canOrbit(session, target)
-    return isSessionActive(session)
-        and target
-        and isAlive(player)
-        and isAlive(target)
+-- Refuses to swing while the target is blocking/countering (and for
+-- a grace window after). Range checks live in the combo engine
+-- instead - movement must always be allowed to close the gap.
+local function isTargetSafeToHit(targetPlayer: Player?): boolean
+    if isTargetGuarding(targetPlayer) then
+        if targetPlayer then
+            lastCounterByTarget[targetPlayer.Name] = os.clock()
+        end
+
+        return false
+    end
+
+    return not isTargetCountedRecently(targetPlayer)
 end
 
-local function attacksPaused()
-    return os.clock() < attackPauseUntil
+-- ============================================================
+-- Improved tracking: velocity prediction with smoothing + clamp.
+-- Raw prediction jitters when the target stops/starts, which is
+-- what made the old orbit feel like it lagged behind. We ease the
+-- predicted position toward the raw prediction each frame instead.
+-- ============================================================
+local function getPredictedPosition(root: BasePart): Vector3
+    local velocity = root.AssemblyLinearVelocity
+    local horizontal = Vector3.new(velocity.X, 0, velocity.Z)
+    local predicted = root.Position + horizontal * FOLLOW_PREDICTION
+    local delta = predicted - root.Position
+
+    if delta.Magnitude > MAX_PREDICTION_DIST then
+        predicted = root.Position + delta.Unit * MAX_PREDICTION_DIST
+    end
+
+    return predicted
 end
 
-local function canAttack(session, target)
-    return canOrbit(session, target) and not attacksPaused()
+local function updateSmoothPosition(raw: Vector3, deltaTime: number): Vector3
+    if not smoothTargetPos then
+        smoothTargetPos = raw
+        return raw
+    end
+
+    smoothTargetPos = smoothTargetPos:Lerp(raw, 1 - math.exp(-SMOOTHING_FACTOR * deltaTime))
+
+    return smoothTargetPos
 end
 
-local function startOrbit(target, session)
-    if orbitConnection then
+-- ============================================================
+-- PlatformStand with a refcount: orbit and the stand both borrow
+-- it, and only the last one to let go restores the old state.
+-- ============================================================
+local function enablePlatformStand()
+    platformStandRefs += 1
+
+    if controlledHumanoid then
         return
     end
 
@@ -217,10 +447,106 @@ local function startOrbit(target, session)
         oldPlatformStand = myHumanoid.PlatformStand
         myHumanoid.PlatformStand = true
     end
+end
+
+local function disablePlatformStand()
+    if platformStandRefs > 0 then
+        platformStandRefs -= 1
+    end
+
+    if platformStandRefs > 0 then
+        return
+    end
+
+    if controlledHumanoid and controlledHumanoid.Parent then
+        controlledHumanoid.PlatformStand = oldPlatformStand
+    end
+
+    controlledHumanoid = nil
+end
+
+local function stopOrbit()
+    if orbitConnection then
+        orbitConnection:Disconnect()
+        orbitConnection = nil
+    end
+
+    disablePlatformStand()
+end
+
+local function getSelectedTarget(): Player?
+    if not selectedTargetName then
+        return nil
+    end
+
+    return Players:FindFirstChild(selectedTargetName) :: Player?
+end
+
+local function isSessionActive(session)
+    return comboEnabled and comboSession == session
+end
+
+local function canAttack(session, target)
+    return isSessionActive(session)
+        and not hidden
+        and target
+        and isAlive(player)
+        and isAlive(target)
+end
+
+-- Finisher timing: the lower the target's HP, the faster we swing.
+local function getTargetHealth(target: Player?): number
+    local humanoid = getHumanoid(target)
+
+    if not humanoid then
+        return math.huge
+    end
+
+    return humanoid.Health
+end
+
+local function isFinisher(target: Player?): boolean
+    return getTargetHealth(target) <= FINISHER_HP_THRESHOLD
+end
+
+local function getM1Delay(target: Player?): number
+    if isFinisher(target) then
+        return TIME_BETWEEN_M1S_FAST
+    end
+
+    return TIME_BETWEEN_M1S
+end
+
+local function getToolDelay(target: Player?): number
+    if isFinisher(target) then
+        return TIME_BETWEEN_TOOLS_FAST
+    end
+
+    return TIME_BETWEEN_TOOLS
+end
+
+-- ============================================================
+-- Orbit movement (used by the combo engine)
+-- trackingMode == "Orbit": smoothed circle strafe.
+-- trackingMode == "Latch": constantly teleport onto the target so
+-- they can never get out of melee range - you always hit.
+-- ============================================================
+local function startOrbit(target, session)
+    if orbitConnection then
+        return
+    end
+
+    enablePlatformStand()
+    smoothTargetPos = nil
+    angle = 0
 
     orbitConnection = RunService.RenderStepped:Connect(function(deltaTime)
-        -- Attack pauses intentionally do not affect orbit movement.
-        if not canOrbit(session, target) then
+        -- The lethal dash owns physics while it runs.
+        if lethalExecuting then
+            return
+        end
+
+        if not canAttack(session, target) then
             stopOrbit()
             return
         end
@@ -233,34 +559,99 @@ local function startOrbit(target, session)
             return
         end
 
-        angle = angle + ORBIT_SPEED * deltaTime
+        if trackingMode == "Latch" then
+            -- Teleport-glued: stay right on top of them every frame.
+            myRoot.CFrame = CFrame.lookAt(
+                targetRoot.Position + Vector3.new(0, 1.2, 0),
+                targetRoot.Position
+            )
 
-        local velocity = targetRoot.AssemblyLinearVelocity
-        local horizontalVelocity = Vector3.new(velocity.X, 0, velocity.Z)
-        local lead = horizontalVelocity * FOLLOW_PREDICTION
-
-        if lead.Magnitude > MAX_FOLLOW_LEAD then
-            lead = lead.Unit * MAX_FOLLOW_LEAD
+            return
         end
 
-        local predictedTargetPosition = targetRoot.Position + lead
+        angle = angle + ORBIT_SPEED * deltaTime
 
-        local orbitPosition = predictedTargetPosition + Vector3.new(
+        local predicted = updateSmoothPosition(getPredictedPosition(targetRoot), deltaTime)
+
+        local orbitPosition = predicted + Vector3.new(
             math.cos(angle) * ORBIT_RADIUS,
             ORBIT_HEIGHT,
             math.sin(angle) * ORBIT_RADIUS
         )
 
-        myRoot.CFrame = CFrame.lookAt(
-            orbitPosition,
-            predictedTargetPosition
-        )
+        myRoot.CFrame = CFrame.lookAt(orbitPosition, predicted)
     end)
+end
+
+-- ============================================================
+-- Combo engine: 3 M1s -> move 1 -> 3 M1s -> move 2 -> ... up to 4
+-- tools, looping until the session dies. Parametrized so both the
+-- main toggle and the stand's .attack can drive it.
+-- ============================================================
+-- Melee range gate: never swing from outside arm's reach.
+local function inMeleeRange(target: Player?): boolean
+    local targetRoot = getRoot(target)
+    local myRoot = getRoot(player)
+
+    return targetRoot ~= nil
+        and myRoot ~= nil
+        and (targetRoot.Position - myRoot.Position).Magnitude <= SMART_MELEE_RANGE
+end
+
+-- Smart swing gate: alive checks + melee range + not swinging into
+-- a block/counter. Used by the M1 and move firers.
+local function shouldSwing(session, target)
+    return canAttack(session, target)
+        and (not smartAttackEnabled or isTargetSafeToHit(target))
+        and inMeleeRange(target)
+end
+
+-- Wall combo: is there an anchored surface right behind the target?
+-- If yes, dash (Q) through them so they splat into it.
+local function targetNearWall(target: Player?): boolean
+    local targetRoot = getRoot(target)
+    local myRoot = getRoot(player)
+
+    if not targetRoot or not myRoot then
+        return false
+    end
+
+    local away = (targetRoot.Position - myRoot.Position).Unit
+
+    if away.Magnitude < 0.001 then
+        return false
+    end
+
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+
+    local filterList: { Instance } = {}
+    local myCharacter = getCharacter(player)
+    local targetCharacter = getCharacter(target)
+
+    if myCharacter then
+        table.insert(filterList, myCharacter)
+    end
+
+    if targetCharacter then
+        table.insert(filterList, targetCharacter)
+    end
+
+    params.FilterDescendantsInstances = filterList
+
+    local hit = workspace:Raycast(targetRoot.Position, away * WALL_RAY_LENGTH, params)
+
+    if hit and hit.Instance and hit.Instance:IsA("BasePart") then
+        return hit.Instance.Anchored
+            and (hit.Position - targetRoot.Position).Magnitude <= WALL_COMBO_MIN_DIST
+    end
+
+    return false
 end
 
 local function doM1(session, target)
     for _ = 1, 3 do
-        if not canAttack(session, target) then
+        if not shouldSwing(session, target) then
             return false
         end
 
@@ -280,14 +671,37 @@ local function doM1(session, target)
             Goal = "LeftClickRelease",
         })
 
-        task.wait(M1_DELAY)
+        task.wait(getM1Delay(target))
     end
 
     return true
 end
 
+local function pressKey(key: Enum.KeyCode)
+    pcall(function()
+        local vim = VirtualInputManager :: any
+        vim:SendKeyEvent(key, true, false, game)
+        vim:SendKeyEvent(key, false, false, game)
+    end)
+end
+
+-- Dash fired through the Communicate remote (Goal = "KeyPress") - the
+-- reliable way TSB scripts dash. We face the target before dashing
+-- (CFrame.lookAt), so Dash = W is aimed straight at them.
+local function fireDashRemote()
+    local remote = getRemote()
+
+    if remote then
+        remote:FireServer({
+            Dash = Enum.KeyCode.W,
+            Key = Enum.KeyCode.Q,
+            Goal = "KeyPress",
+        })
+    end
+end
+
 local function fireMove(toolName, session, target)
-    if not canAttack(session, target) then
+    if not (canAttack(session, target) and inMeleeRange(target)) then
         return false
     end
 
@@ -317,158 +731,71 @@ local function doComboRound(session, target)
             return
         end
 
+        -- M1 reset: dash right after the M1 chain so the combo
+        -- never drops, then keep the pressure on.
+        if m1ResetEnabled then
+            fireDashRemote()
+            task.wait(M1_RESET_DASH_DELAY)
+        end
+
+        -- Wall combo: dash the target into the wall behind them
+        -- right before each move lands.
+        if wallComboEnabled and targetNearWall(target) then
+            fireDashRemote()
+            task.wait(0.12)
+        end
+
         if not fireMove(toolNames[index], session, target) then
             return
         end
 
         if index < toolCount then
-            task.wait(TOOL_DELAY)
+            task.wait(getToolDelay(target))
         end
     end
 end
 
-local function pressG()
-    local remote = getRemote()
+-- Tracks which targets already have kill alerts wired up.
+local killAlerts: { [string]: boolean } = {}
 
-    if not remote then
-        return
-    end
+-- Assigned later (after the chat helpers exist); notifies + says
+-- a line when a combo target dies.
+local alertOnKill: ((targetName: string, target: Player) -> ())? = nil
 
-    remote:FireServer({
-        Key = Enum.KeyCode.G,
-        MoveDirection = Vector3.new(0, 0, 0),
-        Goal = "KeyPress",
-        MousePos = CFrame.new(
-            -138.00552368164,
-            437.50628662109,
-            78.483154296875,
-            0.18005938827991,
-            0.15804965794086,
-            -0.9708753824234,
-            0,
-            0.98700731992722,
-            0.16067577898502,
-            0.98365581035614,
-            -0.028931181877851,
-            0.17771992087364
-        ),
-    })
+-- Assigned later too (they use the chat helpers); forward-declared
+-- so the command handler can call them.
+local pullTarget: ((targetName: string) -> ())? = nil
+local saveConfig: (() -> ())? = nil
+local loadConfig: (() -> ())? = nil
 
-    remote:FireServer({
-        Goal = "KeyRelease",
-        Key = Enum.KeyCode.G,
-    })
-end
-
-local function queueUltimateFourthMove(session)
-    if ultimateQueued then
-        return
-    end
-
-    ultimateQueued = true
-
-    -- Pause attacks only. Orbit continues normally.
-    attackPauseUntil = os.clock() + ULTIMATE_ATTACK_PAUSE
-
-    task.spawn(function()
-        while os.clock() < attackPauseUntil do
-            task.wait(0.05)
-        end
-
-        local target = getSelectedTarget()
-        local toolNames = getToolNames()
-        local fourthMove = toolNames[4]
-
-        if fourthMove and canAttack(session, target) then
-            fireMove(fourthMove, session, target)
-        end
-
-        -- Ignore brief post-move Backpack changes.
-        ultimateIgnoreUntil = os.clock() + 0.5
-        lastToolSignature = getToolSignature(getToolNames())
-        ultimateQueued = false
-    end)
-end
-
-local function watchForUltimate(session)
-    task.spawn(function()
-        while isSessionActive(session) do
-            local toolNames = getToolNames()
-            local signature = getToolSignature(toolNames)
-
-            if not lastToolSignature then
-                lastToolSignature = signature
-
-            elseif signature ~= lastToolSignature then
-                lastToolSignature = signature
-
-                if os.clock() >= ultimateIgnoreUntil and #toolNames >= 4 then
-                    queueUltimateFourthMove(session)
-                end
-            end
-
-            task.wait(TOOL_CHECK_INTERVAL)
-        end
-    end)
-end
-
-local function stopCombo()
-    comboEnabled = false
-    comboSession = comboSession + 1
-    attackPauseUntil = 0
-    ultimateQueued = false
-    stopOrbit()
-end
-
-local function startCombo()
-    local target = getSelectedTarget()
-
-    if not target or target == player then
-        warn("Select a valid target.")
-        return
-    end
-
+local function startComboInternal(targetName: string, useOrbit: boolean)
     comboEnabled = true
     comboSession = comboSession + 1
 
     local session = comboSession
 
-    lastToolSignature = getToolSignature(getToolNames())
-    attackPauseUntil = 0
-    ultimateQueued = false
-
-    -- Continuously attempts G without interrupting attacks or orbit.
     task.spawn(function()
         while isSessionActive(session) do
-            target = getSelectedTarget()
+            local target = Players:FindFirstChild(targetName) :: Player?
 
             if target and isAlive(player) and isAlive(target) then
-                pressG()
-            end
-
-            task.wait(G_REPEAT_INTERVAL)
-        end
-    end)
-
-    watchForUltimate(session)
-
-    task.spawn(function()
-        while isSessionActive(session) do
-            target = getSelectedTarget()
-
-            if target and isAlive(player) and isAlive(target) then
-                startOrbit(target, session)
-
-                if attacksPaused() then
-                    task.wait(0.05)
-                else
-                    doComboRound(session, target)
-                    task.wait(ROUND_DELAY)
+                if alertOnKill then
+                    alertOnKill(targetName, target)
                 end
+
+                -- When the stand is already moving us (latch/annoy/etc),
+                -- let the stand own the movement and only spam the combo.
+                if useOrbit and not standIsMoving() then
+                    startOrbit(target, session)
+                end
+
+                doComboRound(session, target)
+                task.wait(TIME_BETWEEN_ROUNDS)
             else
-                -- Death pauses only. The UI toggle remains on.
+                -- Target may be offline or dead. Keep waiting: the combo
+                -- picks them straight back up when they rejoin/respawn.
                 stopOrbit()
-                task.wait(DEAD_CHECK_DELAY)
+                task.wait(PAUSE_CHECK_DELAY)
             end
         end
 
@@ -476,6 +803,1583 @@ local function startCombo()
     end)
 end
 
+local function stopCombo()
+    comboEnabled = false
+    comboSession = comboSession + 1
+    killAlerts = {}
+    stopOrbit()
+end
+
+local function startCombo()
+    if selectedTargetName == player.Name then
+        warn("You can't target yourself.")
+        return
+    end
+
+    if not selectedTargetName then
+        warn("Select a valid target.")
+        return
+    end
+
+    startComboInternal(selectedTargetName, true)
+end
+
+-- ============================================================
+-- Key spam: holds + releases keys on a loop. R = Burst (keeps the
+-- meter topped up), Q = dash (and dashing cancels ragdolls).
+-- Toggleable in the UI or with the .r / .q commands.
+-- ============================================================
+local function keySpamLoop()
+    task.spawn(function()
+        while true do
+            if isAlive(player) then
+                pcall(function()
+                    -- Cast to any: the runtime signature is
+                    -- SendKeyEvent(key, down, processed, game) but some
+                    -- type defs model the older overload instead.
+                    local vim = VirtualInputManager :: any
+
+                    if rSpamEnabled then
+                        vim:SendKeyEvent(R_SPAM_KEY, true, false, game)
+                        vim:SendKeyEvent(R_SPAM_KEY, false, false, game)
+                    end
+
+                    if qSpamEnabled then
+                        vim:SendKeyEvent(Q_SPAM_KEY, true, false, game)
+                        vim:SendKeyEvent(Q_SPAM_KEY, false, false, game)
+                    end
+                end)
+            end
+
+            task.wait(math.min(R_SPAM_INTERVAL, Q_SPAM_INTERVAL))
+        end
+    end)
+end
+-- ============================================================
+-- Client-side performance cleanup (phone friendly)
+-- EVERYTHING here only affects YOUR client; the server and other
+-- players are unaffected. Flip a flag to false if you want to
+-- keep that specific visual (e.g. attack flashes = effects).
+-- ============================================================
+local CLEANUP_INTERVAL = 6        -- seconds between cleanup sweeps
+local CLEANUP_EFFECTS = true      -- particles, fire, smoke, sparks, trails, beams
+local CLEANUP_DECOR = true        -- invisible, non-colliding anchored parts
+local CLEANUP_LIGHTING_FX = true  -- blur / depth of field / glow / color correction
+local CLEANUP_SOUNDS = true       -- map music / ambient audio
+local DISABLE_SHADOWS = true
+local LOWER_GRAPHICS = true       -- force lowest quality level
+local UNCAPPED_FPS = true         -- removes the client framerate cap if possible
+
+local function isCleanableEffect(instance)
+    return instance:IsA("ParticleEmitter")
+        or instance:IsA("Trail")
+        or instance:IsA("Beam")
+        or instance:IsA("Fire")
+        or instance:IsA("Smoke")
+        or instance:IsA("Sparkles")
+end
+
+-- One full sweep of the map. Returns how many things got removed.
+local function cleanupMapEffects()
+    local cleaned = 0
+
+    for _, instance in ipairs(workspace:GetDescendants()) do
+        if CLEANUP_EFFECTS and isCleanableEffect(instance) then
+            instance:Destroy()
+            cleaned += 1
+        elseif CLEANUP_DECOR
+            and instance:IsA("BasePart")
+            and instance.Transparency >= 0.99
+            and not instance.CanCollide
+            and instance.Anchored then
+            instance:Destroy()
+            cleaned += 1
+        elseif CLEANUP_SOUNDS and instance:IsA("Sound") then
+            instance:Destroy()
+            cleaned += 1
+        end
+    end
+
+    return cleaned
+end
+
+local function cleanupLighting()
+    if CLEANUP_LIGHTING_FX then
+        for _, effect in ipairs(Lighting:GetChildren()) do
+            if effect:IsA("BlurEffect")
+                or effect:IsA("DepthOfFieldEffect")
+                or effect:IsA("SunRaysEffect")
+                or effect:IsA("ColorCorrectionEffect")
+                or effect:IsA("BloomEffect") then
+                effect:Destroy()
+            end
+        end
+
+        local atmosphere = workspace:FindFirstChildOfClass("Atmosphere")
+
+        if atmosphere then
+            atmosphere:Destroy()
+        end
+    end
+
+    if DISABLE_SHADOWS then
+        Lighting.GlobalShadows = false
+        Lighting.ShadowSoftness = 0
+    end
+end
+
+local function applyQualitySettings()
+    if LOWER_GRAPHICS then
+        pcall(function()
+            -- Cast silences the newer type defs, which dropped this property.
+            (settings():GetService("UserGameSettings") :: any).QualityLevel =
+                (Enum :: any).QualityLevel.Level01
+        end)
+    end
+
+    -- Remove the client framerate cap if the executor exposes setfflag.
+    if UNCAPPED_FPS then
+        pcall(function()
+            local setFFlag = getgenv().setfflag
+
+            if type(setFFlag) == "function" then
+                setFFlag("DFIntTaskSchedulerTargetFps", "999")
+            end
+        end)
+    end
+end
+
+local function startCleanupLoop()
+    applyQualitySettings()
+    cleanupLighting()
+
+    task.spawn(function()
+        while true do
+            pcall(cleanupMapEffects)
+            pcall(cleanupLighting)
+
+            task.wait(CLEANUP_INTERVAL)
+        end
+    end)
+end
+
+startCleanupLoop()
+
+-- ============================================================
+-- STAND SYSTEM
+-- The stand is your own character, teleport-glued wherever the
+-- current action wants it. One RenderStepped connection owns all
+-- stand movement; switching action just changes the tick function.
+-- ============================================================
+local function getStandTarget(): Player?
+    if not standTargetName then
+        return nil
+    end
+
+    return Players:FindFirstChild(standTargetName) :: Player?
+end
+
+local function getStandOwner(): Player?
+    if not standOwnerName then
+        return nil
+    end
+
+    return Players:FindFirstChild(standOwnerName) :: Player?
+end
+
+-- follow: hover glued behind the owner.
+local function standFollowTick()
+    local owner = getStandOwner()
+    local myRoot = getRoot(player)
+    local ownerRoot = getRoot(owner)
+
+    if not owner or not myRoot or not ownerRoot then
+        return
+    end
+
+    -- Behind the owner by default; flanks them when "beside" is on.
+    local x = besideFollow and standFollowDist or 0
+    local z = besideFollow and 0 or standFollowDist
+
+    myRoot.CFrame = CFrame.lookAt(
+        ownerRoot.Position + Vector3.new(x, STAND_FOLLOW_HEIGHT, z),
+        ownerRoot.Position
+    )
+end
+
+-- annoy: buzz around the victim, stomp on them every half second.
+local function standAnnoyTick(deltaTime)
+    local target = getStandTarget()
+    local myRoot = getRoot(player)
+    local targetRoot = getRoot(target)
+
+    if not target or not myRoot or not targetRoot then
+        return
+    end
+
+    standAngle = standAngle + STAND_ANNOY_SPEED * deltaTime
+    standBumpTimer += deltaTime
+
+    local predicted = updateSmoothPosition(getPredictedPosition(targetRoot), deltaTime)
+
+    local orbitPosition = predicted + Vector3.new(
+        math.cos(standAngle) * STAND_ANNOY_RADIUS,
+        1,
+        math.sin(standAngle) * STAND_ANNOY_RADIUS
+    )
+
+    myRoot.CFrame = CFrame.lookAt(orbitPosition, predicted)
+
+    if standBumpTimer >= STAND_BUMP_INTERVAL then
+        standBumpTimer = 0
+        myRoot.CFrame = CFrame.lookAt(
+            targetRoot.Position + Vector3.new(0, 2, 0),
+            targetRoot.Position
+        )
+    end
+end
+
+-- latch / attack: teleport-glued onto the target so you are always
+-- in melee range - they cannot shake you off.
+local function standLatchTick()
+    local target = getStandTarget()
+    local myRoot = getRoot(player)
+    local targetRoot = getRoot(target)
+
+    if not target or not myRoot or not targetRoot then
+        return
+    end
+
+    myRoot.CFrame = CFrame.lookAt(
+        targetRoot.Position + Vector3.new(0, 1.2, 0),
+        targetRoot.Position
+    )
+end
+
+-- orbit: circle strafe the target at stand speed.
+local function standOrbitTick(deltaTime)
+    local target = getStandTarget()
+    local myRoot = getRoot(player)
+    local targetRoot = getRoot(target)
+
+    if not target or not myRoot or not targetRoot then
+        return
+    end
+
+    standAngle = standAngle + STAND_ANNOY_SPEED * deltaTime
+
+    local predicted = updateSmoothPosition(getPredictedPosition(targetRoot), deltaTime)
+
+    myRoot.CFrame = CFrame.lookAt(
+        predicted + Vector3.new(
+            math.cos(standAngle) * ORBIT_RADIUS,
+            ORBIT_HEIGHT,
+            math.sin(standAngle) * ORBIT_RADIUS
+        ),
+        predicted
+    )
+end
+
+-- fling: glue to the victim, then blast them with random velocity
+-- every frame so they rocket around the map.
+local function standFlingTick()
+    local target = getStandTarget()
+    local myRoot = getRoot(player)
+    local targetRoot = getRoot(target)
+
+    if not target or not myRoot or not targetRoot then
+        return
+    end
+
+    myRoot.CFrame = CFrame.lookAt(
+        targetRoot.Position + Vector3.new(0, 1, 0),
+        targetRoot.Position
+    )
+
+    targetRoot.AssemblyLinearVelocity = Vector3.new(
+        math.random(-STAND_FLING_POWER, STAND_FLING_POWER),
+        math.random(STAND_FLING_POWER, STAND_FLING_POWER + 60),
+        math.random(-STAND_FLING_POWER, STAND_FLING_POWER)
+    )
+end
+
+-- carry: hold the victim in front of us; wherever we go, they come
+-- with us. Move around and they get dragged along.
+local function standCarryTick()
+    local target = getStandTarget()
+    local myRoot = getRoot(player)
+    local targetRoot = getRoot(target)
+
+    if not target or not myRoot or not targetRoot then
+        return
+    end
+
+    targetRoot.CFrame = myRoot.CFrame * STAND_CARRY_OFFSET
+end
+
+local function stopStandMovement()
+    if standConnection then
+        standConnection:Disconnect()
+        standConnection = nil
+    end
+
+    disablePlatformStand()
+end
+
+local function startStandMovement()
+    if standConnection then
+        return
+    end
+
+    enablePlatformStand()
+    smoothTargetPos = nil
+    standAngle = 0
+    standBumpTimer = 0
+
+    standConnection = RunService.RenderStepped:Connect(function(deltaTime)
+        if not standEnabled or standAction == "stop" then
+            stopStandMovement()
+            return
+        end
+
+        -- Hidden below the map: stay put until HP recovers.
+        if hidden then
+            return
+        end
+
+        if standAction == "follow" then
+            standFollowTick()
+        elseif standAction == "annoy" then
+            standAnnoyTick(deltaTime)
+        elseif standAction == "fling" then
+            standFlingTick()
+        elseif standAction == "latch" or standAction == "attack" then
+            standLatchTick()
+        elseif standAction == "carry" then
+            standCarryTick()
+        elseif standAction == "orbit" then
+            standOrbitTick(deltaTime)
+        end
+    end)
+end
+
+local function setStandAction(action: string)
+    standAction = action
+    stopStandMovement()
+
+    if standEnabled and action ~= "stop" then
+        startStandMovement()
+    end
+end
+
+local function setStandEnabled(enabled: boolean)
+    standEnabled = enabled
+
+    if not enabled then
+        stopStandMovement()
+    elseif standAction ~= "stop" then
+        startStandMovement()
+    end
+end
+
+-- ============================================================
+-- Lethal dash (ported from the loopdash TSB script)
+-- Vertical pop -> dash straight at the target -> spiral around them
+-- (radius shrinking to zero) -> hard velocity cancel once glued.
+-- Physics must be ours while it runs, so the orbit and stand
+-- movement stand down; they resume automatically when it ends.
+-- ============================================================
+local function setOtherPlayersNoclipped(enabled: boolean)
+    if not LETHAL_NOCLIP then
+        return
+    end
+
+    for _, model in ipairs(workspace:GetChildren()) do
+        if model:IsA("Model")
+            and model ~= player.Character
+            and model:FindFirstChildOfClass("Humanoid") then
+            for _, part in ipairs(model:GetDescendants()) do
+                if part:IsA("BasePart") then
+                    if enabled then
+                        if part.CanCollide then
+                            lethalNoclipped[part] = true
+                            part.CanCollide = false
+                        end
+                    elseif lethalNoclipped[part] then
+                        part.CanCollide = true
+                        lethalNoclipped[part] = nil
+                    end
+                end
+            end
+        end
+    end
+end
+
+local function clearOwnVelocity()
+    local myRoot = getRoot(player)
+
+    if not myRoot then
+        return
+    end
+
+    for _, obj in ipairs(myRoot:GetChildren()) do
+        if obj:IsA("BodyVelocity")
+            or obj:IsA("LinearVelocity")
+            or obj:IsA("BodyAngularVelocity")
+            or obj:IsA("BodyPosition")
+            or obj:IsA("Attachment") then
+            obj:Destroy()
+        end
+    end
+
+    myRoot.AssemblyLinearVelocity = Vector3.zero
+end
+
+local function abortLethal()
+    lethalExecuting = false
+    clearOwnVelocity()
+    setOtherPlayersNoclipped(false)
+
+    -- Pick up where we left off: the stand and combo resume on their own.
+    if standEnabled and standAction ~= "stop" then
+        startStandMovement()
+    end
+end
+
+local function executeLethal(target: Player?)
+    if lethalExecuting or hidden then
+        return
+    end
+
+    local myRoot = getRoot(player)
+    local myHumanoid = getHumanoid(player)
+    local targetRoot = getRoot(target)
+
+    if not myRoot or not myHumanoid or not targetRoot then
+        return
+    end
+
+    if (myRoot.Position - targetRoot.Position).Magnitude > LETHAL_RANGE then
+        return
+    end
+
+    -- Give physics away: drop orbit + stand movement so the jump
+    -- arc and the spin aren't fought by teleporting.
+    lethalExecuting = true
+    stopOrbit()
+    stopStandMovement()
+
+    task.wait(LETHAL_DELAY)
+
+    if not lethalExecuting or not isAlive(player) or not isAlive(target) then
+        abortLethal()
+        return
+    end
+
+    -- The combo loop may have restarted the orbit; make sure we're
+    -- off PlatformStand so the pop actually arcs.
+    stopOrbit()
+    myHumanoid.PlatformStand = false
+
+    -- Vertical pop, then dash straight at them.
+    myRoot.AssemblyLinearVelocity = Vector3.new(
+        myRoot.AssemblyLinearVelocity.X,
+        LETHAL_JUMP,
+        myRoot.AssemblyLinearVelocity.Z
+    )
+    fireDashRemote()
+
+    local startTime = os.clock()
+    local forwardDir = (targetRoot.Position - myRoot.Position).Unit
+    local sideVec = Vector3.new(-forwardDir.Z, 0, forwardDir.X)
+
+    local bav = Instance.new("BodyAngularVelocity")
+    bav.MaxTorque = Vector3.new(0, 1000000, 0)
+    bav.P = 15000
+    bav.Parent = myRoot
+
+    setOtherPlayersNoclipped(true)
+
+    local connection: RBXScriptConnection? = nil
+    connection = RunService.Heartbeat:Connect(function()
+        if not lethalExecuting or not isAlive(player) or not isAlive(target) then
+            if connection then
+                connection:Disconnect()
+            end
+
+            abortLethal()
+            return
+        end
+
+        local currentTargetRoot = getRoot(target)
+        local currentMyRoot = getRoot(player)
+
+        if not currentTargetRoot or not currentMyRoot then
+            if connection then
+                connection:Disconnect()
+            end
+
+            abortLethal()
+            return
+        end
+
+        local elapsed = os.clock() - startTime
+
+        -- Spiral around them: radius shrinks to zero as we close in,
+        -- so we whip around their back and end glued at their feet.
+        local angle = (elapsed / 0.45) * (math.pi / 1.5)
+        local radius = LETHAL_RADIUS * (1 - math.clamp(elapsed / 0.45, 0, 1))
+        local targetLookPos = currentTargetRoot.Position
+            + (sideVec * math.cos(angle) + forwardDir * math.sin(angle)) * radius
+
+        local lookAtCF = CFrame.lookAt(currentMyRoot.Position, Vector3.new(
+            targetLookPos.X,
+            currentMyRoot.Position.Y,
+            targetLookPos.Z
+        ))
+
+        local relativeCF = currentMyRoot.CFrame:Inverse() * lookAtCF
+        local _, y, _ = relativeCF:ToEulerAnglesXYZ()
+
+        if bav.Parent then
+            bav.AngularVelocity = Vector3.new(0, y * 30, 0)
+        end
+
+        local distXZ = (Vector2.new(currentMyRoot.Position.X, currentMyRoot.Position.Z)
+            - Vector2.new(currentTargetRoot.Position.X, currentTargetRoot.Position.Z)).Magnitude
+
+        if elapsed > LETHAL_CANCEL_DELAY and distXZ < LETHAL_CANCEL_DIST then
+            if connection then
+                connection:Disconnect()
+            end
+
+            abortLethal()
+            return
+        end
+
+        if elapsed > LETHAL_TIMEOUT or hidden then
+            if connection then
+                connection:Disconnect()
+            end
+
+            abortLethal()
+            return
+        end
+    end)
+end
+
+-- Auto trigger: while fighting, attempt the lethal whenever the
+-- target drifts back into range.
+local function lethalLoop()
+    task.spawn(function()
+        while true do
+            if lethalEnabled and not lethalExecuting and not hidden and isAlive(player) then
+                local target = getStandTarget() or getSelectedTarget()
+
+                if target and isAlive(target) then
+                    local root = getRoot(target)
+                    local myRoot = getRoot(player)
+
+                    if root and myRoot
+                        and (root.Position - myRoot.Position).Magnitude <= LETHAL_RANGE then
+                        executeLethal(target)
+                    end
+                end
+            end
+
+            task.wait(LETHAL_INTERVAL)
+        end
+    end)
+end
+
+-- ============================================================
+-- Chat command engine
+-- Commands work from the local player always, and from whoever is
+-- currently the stand owner. Chat is read through the default chat
+-- system's OnMessageDoneFiltering so we hear the owner's messages
+-- without seeing their client.
+-- ============================================================
+local function say(text: string)
+    -- Silent mode: the script never writes chat lines, so the people
+    -- you're griefing can't read your next move. Notifications still fire.
+    if silentChat then
+        return
+    end
+
+    pcall(function()
+        local chatEvents = ReplicatedStorage:FindFirstChild("DefaultChatSystemChatEvents")
+
+        if not chatEvents then
+            return
+        end
+
+        local sayRemote = chatEvents:FindFirstChild("SayMessageRequest")
+
+        if sayRemote and sayRemote:IsA("RemoteEvent") then
+            sayRemote:FireServer(text, "All")
+        end
+    end)
+end
+
+local function notify(title: string, text: string)
+    pcall(function()
+        game:GetService("StarterGui"):SetCore("SendNotification", {
+            Title = title,
+            Text = text,
+            Duration = 4,
+        })
+    end)
+end
+
+-- Reply that respects silent mode: chat line when chatty, a
+-- client-side notification when silent.
+local function reply(text: string)
+    if silentChat then
+        notify("Stand", text)
+    else
+        say(text)
+    end
+end
+
+local COMMAND_HELP = {
+    { ".help", "this list" },
+    { ".owner <name>", "transfer stand control" },
+    { ".give <name>", "give someone else the stand" },
+    { ".follow", "stand follows its owner" },
+    { ".annoy <name>", "buzz + stomp the target" },
+    { ".fling <name>", "latch and launch the target" },
+    { ".latch <name>", "teleport-glue onto the target" },
+    { ".carry <name>", "pick them up and drag them" },
+    { ".orbit <name>", "circle-strafe the target" },
+    { ".attack <name>", "latch + auto-combo them" },
+    { ".stop", "stop stand + combo" },
+    { ".silent [on/off]", "never write chat lines" },
+    { ".smart [on/off]", "avoid blocks/counters" },
+    { ".wall [on/off]", "dash into walls during combos" },
+    { ".ult [on/off]", "auto-ult while fighting" },
+    { ".beside [on/off]", "follow beside you, not behind" },
+    { ".standdist <N>", "follow distance (1-10 studs)" },
+    { ".reset [on/off]", "dash between M1 chains" },
+    { ".lethal [on/off|<name>]", "lethal dash (auto / once)" },
+    { ".r [on/off]", "toggle R (Burst) spam" },
+    { ".q [on/off]", "toggle Q (dash/evade) spam" },
+    { ".f [on/off]", "auto-block when target is close" },
+    { ".esp [on/off]", "see everyone through walls" },
+    { ".speed [on/off|N]", "speed boost (custom N = value)" },
+    { ".pull <name>", "yank the target to you + latch" },
+    { ".hide [on/off]", "toggle low-HP hide under the map" },
+    { ".save", "save settings to disk" },
+    { ".load", "reload settings from disk" },
+    { ".mode <orbit|latch>", "combo tracking mode" },
+    { ".target <name>", "set main combo target" },
+}
+
+-- Exact match first, then case-insensitive, then unique prefix.
+local function resolvePlayerName(input: string): string?
+    if not input or input == "" then
+        return nil
+    end
+
+    local exact = Players:FindFirstChild(input)
+
+    if exact then
+        return exact.Name
+    end
+
+    local lower = string.lower(input)
+    local matches = {}
+
+    for _, otherPlayer in ipairs(Players:GetPlayers()) do
+        local name = otherPlayer.Name
+
+        if string.lower(name) == lower then
+            return name
+        elseif string.lower(string.sub(name, 1, #input)) == lower then
+            table.insert(matches, name)
+        end
+    end
+
+    if #matches == 1 then
+        return matches[1]
+    end
+
+    return nil
+end
+
+local function handleCommand(message: string, speakerName: string)
+    local trimmed = string.gsub(message, "^%s+", "")
+
+    if string.sub(trimmed, 1, 1) ~= "." then
+        return
+    end
+
+    -- The injector always has god rights; otherwise only the owner.
+    if speakerName ~= player.Name and speakerName ~= standOwnerName then
+        return
+    end
+
+    local args = {}
+
+    for arg in string.gmatch(string.sub(trimmed, 2), "%S+") do
+        table.insert(args, arg)
+    end
+
+    local command = string.lower(args[1] or "")
+
+    -- Resolve a command's target: the given name, else the stand
+    -- target, else the main combo target.
+    local function resolveCommandTarget(argName: string?)
+        if argName and argName ~= "" then
+            return resolvePlayerName(argName)
+        end
+
+        return standTargetName or selectedTargetName
+    end
+
+    if command == "help" then
+        local lines = {}
+
+        for _, entry in ipairs(COMMAND_HELP) do
+            table.insert(lines, entry[1] .. " - " .. entry[2])
+        end
+
+        if silentChat then
+            notify("Stand commands", table.concat(lines, " | "))
+        else
+            say("[Stand] " .. table.concat(lines, " | "))
+        end
+
+        return
+    end
+
+    if command == "owner" or command == "give" then
+        local targetName = resolvePlayerName(args[2] or "")
+
+        if not targetName then
+            reply("[Stand] Usage: .owner <name>")
+            return
+        end
+
+        standOwnerName = targetName
+        pcall(function()
+            ownerDropdown:Select(targetName)
+        end)
+        notify("Stand owner changed", "Control transferred to " .. targetName)
+        say("[Stand] Owner is now " .. targetName)
+        return
+    end
+
+    if command == "follow" then
+        setStandEnabled(true)
+        setStandAction("follow")
+        notify("Stand", "Following " .. (standOwnerName or "owner"))
+        say("[Stand] Following " .. (standOwnerName or "owner"))
+        return
+    end
+
+    if command == "stop" then
+        setStandAction("stop")
+        stopCombo()
+        notify("Stand", "Stopped")
+        say("[Stand] Stopped")
+        return
+    end
+
+    if command == "r" then
+        local value = string.lower(args[2] or "")
+
+        if value == "off" then
+            rSpamEnabled = false
+        else
+            rSpamEnabled = true
+        end
+
+        pcall(function()
+            rSpamToggle:Set(rSpamEnabled)
+        end)
+        notify("R spam (Burst)", rSpamEnabled and "ON" or "OFF")
+        return
+    end
+
+    if command == "q" then
+        local value = string.lower(args[2] or "")
+
+        if value == "off" then
+            qSpamEnabled = false
+        else
+            qSpamEnabled = true
+        end
+
+        pcall(function()
+            qSpamToggle:Set(qSpamEnabled)
+        end)
+        notify("Q spam (dash/evade)", qSpamEnabled and "ON" or "OFF")
+        return
+    end
+
+    if command == "silent" then
+        silentChat = string.lower(args[2] or "") ~= "off"
+
+        pcall(function()
+            silentToggle:Set(silentChat)
+        end)
+        notify("Silent mode", silentChat and "ON (no chat lines)" or "OFF")
+        return
+    end
+
+    if command == "smart" then
+        smartAttackEnabled = string.lower(args[2] or "") ~= "off"
+
+        pcall(function()
+            smartToggle:Set(smartAttackEnabled)
+        end)
+        notify("Smart attack", smartAttackEnabled and "ON (avoids blocks/counters)" or "OFF")
+        return
+    end
+
+    if command == "wall" or command == "wallq" then
+        wallComboEnabled = string.lower(args[2] or "") ~= "off"
+
+        pcall(function()
+            wallToggle:Set(wallComboEnabled)
+        end)
+        notify("Wall combo", wallComboEnabled and "ON (Q into walls)" or "OFF")
+        return
+    end
+
+    if command == "ult" then
+        autoUltEnabled = string.lower(args[2] or "") ~= "off"
+
+        pcall(function()
+            ultToggle:Set(autoUltEnabled)
+        end)
+        notify("Auto ult", autoUltEnabled and "ON" or "OFF")
+        return
+    end
+
+    if command == "beside" then
+        besideFollow = string.lower(args[2] or "") ~= "off"
+
+        pcall(function()
+            besideToggle:Set(besideFollow)
+        end)
+        notify("Follow mode", besideFollow and "beside owner" or "behind owner")
+        return
+    end
+
+    if command == "reset" then
+        m1ResetEnabled = string.lower(args[2] or "") ~= "off"
+
+        pcall(function()
+            resetToggle:Set(m1ResetEnabled)
+        end)
+        notify("M1 reset", m1ResetEnabled and "ON (dash between chains)" or "OFF")
+        return
+    end
+
+    if command == "lethal" or command == "ldash" then
+        local toggleValue = string.lower(args[2] or "")
+
+        if toggleValue == "on" or toggleValue == "off" then
+            lethalEnabled = toggleValue == "on"
+
+            pcall(function()
+                lethalToggle:Set(lethalEnabled)
+            end)
+            notify("Lethal dash", lethalEnabled and "ON (auto while fighting)" or "OFF")
+        else
+            -- .lethal <name> (or bare) fires it once at the current target.
+            local targetName = resolveCommandTarget(args[2])
+            local target = targetName and (Players:FindFirstChild(targetName) :: Player?)
+                or getStandTarget()
+                or getSelectedTarget()
+
+            if target then
+                executeLethal(target)
+            else
+                reply("[Stand] No target for lethal dash")
+            end
+        end
+
+        return
+    end
+
+    if command == "standdist" then
+        local distance = tonumber(args[2] or "")
+
+        if not distance then
+            reply("[Stand] Usage: .standdist <1-10>")
+            return
+        end
+
+        standFollowDist = math.clamp(distance, 1, 10)
+        notify("Follow distance", tostring(standFollowDist) .. " studs")
+        return
+    end
+
+    if command == "hide" then
+        local value = string.lower(args[2] or "")
+
+        if value == "off" then
+            hideEnabled = false
+        else
+            hideEnabled = true
+        end
+
+        pcall(function()
+            hideToggle:Set(hideEnabled)
+        end)
+        notify("Low-HP hide", hideEnabled and "ON" or "OFF")
+        return
+    end
+
+    if command == "f" then
+        local value = string.lower(args[2] or "")
+
+        if value == "off" then
+            autoBlockEnabled = false
+        else
+            autoBlockEnabled = true
+        end
+
+        pcall(function()
+            blockToggle:Set(autoBlockEnabled)
+        end)
+        notify("Auto-block", autoBlockEnabled and "ON" or "OFF")
+        return
+    end
+
+    if command == "esp" then
+        local value = string.lower(args[2] or "")
+
+        if value == "off" then
+            espEnabled = false
+        else
+            espEnabled = true
+        end
+
+        pcall(function()
+            espToggle:Set(espEnabled)
+        end)
+        notify("ESP", espEnabled and "ON" or "OFF")
+        return
+    end
+
+    if command == "speed" then
+        local value = args[2]
+        local parsedSpeed = value and tonumber(value)
+
+        if parsedSpeed then
+            -- .speed 32 style: custom value while keeping it on.
+            SPEED_BOOST_VALUE = parsedSpeed
+            speedBoostEnabled = true
+        else
+            local toggleValue = string.lower(value or "")
+
+            if toggleValue == "off" then
+                speedBoostEnabled = false
+            else
+                speedBoostEnabled = true
+            end
+        end
+
+        local speedText = "OFF"
+
+        if speedBoostEnabled then
+            speedText = "ON (" .. tostring(SPEED_BOOST_VALUE) .. ")"
+        end
+
+        pcall(function()
+            speedToggle:Set(speedBoostEnabled)
+        end)
+        notify("Speed boost", speedText)
+        return
+    end
+
+    if command == "pull" then
+        local targetName = resolveCommandTarget(args[2])
+
+        if not targetName then
+            reply("[Stand] Usage: .pull <name>")
+            return
+        end
+
+        if targetName == player.Name then
+            reply("[Stand] Can't pull yourself")
+            return
+        end
+
+        if pullTarget then
+            pullTarget(targetName)
+        end
+
+        return
+    end
+
+    if command == "save" then
+        if saveConfig then
+            saveConfig()
+        end
+
+        return
+    end
+
+    if command == "load" then
+        if loadConfig then
+            loadConfig()
+        end
+
+        return
+    end
+
+    if command == "mode" or command == "track" then
+        local value = string.lower(args[2] or "")
+
+        if value == "latch" then
+            trackingMode = "Latch"
+        elseif value == "orbit" then
+            trackingMode = "Orbit"
+        else
+            reply("[Stand] Usage: .mode <orbit|latch>")
+            return
+        end
+
+        pcall(function()
+            trackingDropdown:Select(trackingMode)
+        end)
+        notify("Tracking mode", trackingMode)
+        return
+    end
+
+    if command == "target" then
+        local targetName = resolvePlayerName(args[2] or "")
+
+        if not targetName then
+            reply("[Stand] Usage: .target <name>")
+            return
+        end
+
+        selectedTargetName = targetName
+        pcall(function()
+            targetDropdown:Select(targetName)
+        end)
+        notify("Target set", targetName)
+        return
+    end
+
+    -- Target-driven actions.
+    if command == "annoy"
+        or command == "fling"
+        or command == "latch"
+        or command == "carry"
+        or command == "orbit"
+        or command == "attack" then
+
+        local targetName = resolveCommandTarget(args[2])
+
+        if not targetName then
+            reply("[Stand] Usage: ." .. command .. " <name>")
+            return
+        end
+
+        if targetName == player.Name then
+            reply("[Stand] Can't use ." .. command .. " on yourself")
+            return
+        end
+
+        standTargetName = targetName
+        setStandEnabled(true)
+
+        if command == "attack" then
+            setStandAction("attack")
+            stopCombo()
+            startComboInternal(targetName, false)
+        else
+            setStandAction(command)
+        end
+
+        if command == "annoy" then
+            rSpamEnabled = true
+        end
+
+        notify("Stand: " .. command, "Target: " .. targetName)
+        say("[Stand] " .. command .. " -> " .. targetName)
+        return
+    end
+end
+
+local function wireChatCommands()
+    local chatEvents = ReplicatedStorage:FindFirstChild("DefaultChatSystemChatEvents")
+
+    if chatEvents then
+        local onMessage = chatEvents:FindFirstChild("OnMessageDoneFiltering")
+
+        if onMessage and onMessage:IsA("RemoteEvent") then
+            onMessage.OnClientEvent:Connect(function(data: any)
+                pcall(function()
+                    handleCommand(
+                        tostring(data.Message),
+                        tostring(data.FromSpeaker)
+                    )
+                end)
+            end)
+        end
+    end
+
+    -- Our own messages, in case the game's chat bypasses the filter.
+    player.Chatted:Connect(function(msg)
+        handleCommand(msg, player.Name)
+    end)
+end
+
+-- ============================================================
+-- Low-HP hide: dip below the map when OUR HP gets low, wait for
+-- regen, then come back and pick up where we left off. The combo
+-- and stand both pause while we're under the map.
+-- ============================================================
+local function isLowHp(): boolean
+    local myHumanoid = getHumanoid(player)
+
+    return myHumanoid ~= nil
+        and myHumanoid.Health > 0
+        and myHumanoid.Health <= LOW_HP_THRESHOLD
+end
+
+local function hideBelowMap()
+    -- Cancel any lethal dash first so we don't spiral below the map.
+    if lethalExecuting then
+        abortLethal()
+    end
+
+    local myRoot = getRoot(player)
+
+    if not myRoot then
+        return
+    end
+
+    -- Remember what to resume once we're back.
+    comboWasOn = comboEnabled
+    standResumeAction = standEnabled and standAction ~= "stop" and standAction or nil
+
+    stopCombo()
+
+    if standEnabled then
+        stopStandMovement()
+    end
+
+    hidden = true
+    local hideSpot = myRoot.Position
+    surfacePosition = hideSpot
+    enablePlatformStand()
+
+    myRoot.CFrame = CFrame.new(hideSpot.X, HIDE_DEPTH, hideSpot.Z)
+
+    notify("Low HP", "Dipping below the map until HP recovers...")
+end
+
+local function returnToSurface()
+    local myRoot = getRoot(player)
+
+    if myRoot and surfacePosition then
+        myRoot.CFrame = CFrame.new(surfacePosition) + Vector3.new(0, 3, 0)
+    end
+
+    hidden = false
+    surfacePosition = nil
+    disablePlatformStand()
+
+    local resumeAction = standResumeAction
+    local resumeCombo = comboWasOn
+    standResumeAction = nil
+    comboWasOn = false
+
+    if resumeCombo then
+        -- The stand's .attack combo targets the stand target, not the
+        -- main selection, so restart it on the right person.
+        if resumeAction == "attack" and standTargetName then
+            startComboInternal(standTargetName, false)
+        else
+            startCombo()
+        end
+    end
+
+    if resumeAction then
+        setStandEnabled(true)
+        setStandAction(resumeAction)
+    end
+
+    notify("HP recovered", "Back in the fight")
+end
+
+local function hideLoop()
+    task.spawn(function()
+        while true do
+            if hideEnabled and not hidden and isLowHp() then
+                hideBelowMap()
+            elseif hidden then
+                local myHumanoid = getHumanoid(player)
+
+                if not myHumanoid or myHumanoid.Health <= 0 then
+                    -- Died under the map; just clear the hide state.
+                    hidden = false
+                    surfacePosition = nil
+                elseif myHumanoid.Health >= LOW_HP_RECOVER then
+                    returnToSurface()
+                end
+            end
+
+            task.wait(HIDE_CHECK_DELAY)
+        end
+    end)
+end
+
+-- ============================================================
+-- Kill alert: when a combo target dies, send a notification and
+-- a chat line. Wired once per target per combo session.
+-- ============================================================
+alertOnKill = function(targetName: string, target: Player)
+    if killAlerts[targetName] then
+        return
+    end
+
+    local humanoid = getHumanoid(target)
+
+    if not humanoid then
+        return
+    end
+
+    killAlerts[targetName] = true
+
+    humanoid.Died:Connect(function()
+        if comboEnabled then
+            notify("Eliminated", targetName .. " is down")
+            say("[Stand] " .. targetName .. " eliminated")
+        end
+    end)
+end
+
+-- ============================================================
+-- Auto-block: hold F while the target is close, release when they
+-- back off or when disabled. Q-dash spam still works while
+-- blocking, so you can block-tank and dash away at the same time.
+-- ============================================================
+local function updateBlockKey(hold: boolean)
+    if hold == blockHeld then
+        return
+    end
+
+    blockHeld = hold
+
+    pcall(function()
+        local vim = VirtualInputManager :: any
+        vim:SendKeyEvent(BLOCK_KEY, hold, false, game)
+    end)
+end
+
+local function autoBlockLoop()
+    task.spawn(function()
+        while true do
+            if autoBlockEnabled and isAlive(player) then
+                local target = getSelectedTarget()
+                local myRoot = getRoot(player)
+                local targetRoot = getRoot(target)
+                local close = targetRoot and myRoot
+                    and (targetRoot.Position - myRoot.Position).Magnitude <= BLOCK_RANGE
+
+                updateBlockKey(close == true)
+            else
+                updateBlockKey(false)
+            end
+
+            task.wait(BLOCK_CHECK_DELAY)
+        end
+    end)
+end
+
+-- ============================================================
+-- Auto ult: while fighting (combo active or stand moving) and the
+-- target is close, tap the ult key. Empty-bar taps are no-ops, so
+-- this only fires when it's actually ready.
+-- ============================================================
+local function ultLoop()
+    task.spawn(function()
+        while true do
+            if autoUltEnabled and isAlive(player) and not hidden then
+                local inCombat = comboEnabled or standIsMoving()
+
+                if inCombat then
+                    local target = getStandTarget() or getSelectedTarget()
+                    local targetRoot = getRoot(target)
+                    local myRoot = getRoot(player)
+                    local close = targetRoot and myRoot
+                        and (targetRoot.Position - myRoot.Position).Magnitude <= 30
+
+                    if close then
+                        pressKey(ULT_KEY)
+                    end
+                end
+            end
+
+            task.wait(ULT_PRESS_INTERVAL)
+        end
+    end)
+end
+
+-- ============================================================
+-- ESP: client-only name + HP tags and glowing outlines for every
+-- other player. Instances are created on YOUR client only, so the
+-- tags don't replicate to anyone else (safer than painting models).
+-- ============================================================
+local function applyEspTo(targetPlayer: Player)
+    pcall(function()
+        local character = targetPlayer.Character
+
+        if not character then
+            return
+        end
+
+        if not character:FindFirstChild("EspHighlight") then
+            local highlight = Instance.new("Highlight")
+            highlight.Name = "EspHighlight"
+            highlight.FillTransparency = 0.9
+            highlight.OutlineColor = Color3.new(1, 0.15, 0.15)
+            highlight.Parent = character
+        end
+
+        local head = character:FindFirstChild("Head")
+
+        if head and not head:FindFirstChild("EspTag") then
+            local tag = Instance.new("BillboardGui")
+            tag.Name = "EspTag"
+            tag.AlwaysOnTop = true
+            tag.Size = UDim2.fromOffset(160, 36)
+            tag.Adornee = head
+
+            local label = Instance.new("TextLabel")
+            label.Size = UDim2.fromScale(1, 1)
+            label.BackgroundTransparency = 1
+            label.TextStrokeTransparency = 0
+            label.TextScaled = true
+            label.TextColor3 = Color3.new(1, 0.2, 0.2)
+            label.Text = targetPlayer.Name
+            label.Parent = tag
+
+            tag.Parent = head
+        end
+    end)
+end
+
+local function updateEspTag(targetPlayer: Player)
+    pcall(function()
+        local character = targetPlayer.Character
+
+        if not character then
+            return
+        end
+
+        local head = character:FindFirstChild("Head")
+        local tag = head and head:FindFirstChild("EspTag")
+
+        if not tag or not tag:IsA("BillboardGui") then
+            return
+        end
+
+        local humanoid = getHumanoid(targetPlayer)
+        local hpText = humanoid and tostring(math.floor(humanoid.Health)) or "?"
+
+        local label = tag:FindFirstChildOfClass("TextLabel")
+
+        if label then
+            label.Text = targetPlayer.Name .. " | " .. hpText .. " HP"
+        end
+    end)
+end
+
+local function espLoop()
+    task.spawn(function()
+        while true do
+            if espEnabled then
+                for _, otherPlayer in ipairs(Players:GetPlayers()) do
+                    if otherPlayer ~= player then
+                        applyEspTo(otherPlayer)
+                        updateEspTag(otherPlayer)
+                    end
+                end
+            end
+
+            task.wait(ESP_UPDATE_DELAY)
+        end
+    end)
+end
+
+-- ============================================================
+-- Speed boost: bump WalkSpeed while enabled, restore on disable.
+-- (TSB may clamp WalkSpeed server-side; it's pcall'd so it just
+-- silently does nothing on servers that fight it.)
+-- ============================================================
+local function speedLoop()
+    task.spawn(function()
+        while true do
+            local myHumanoid = getHumanoid(player)
+
+            if speedBoostEnabled and myHumanoid then
+                if not baseWalkSpeed then
+                    baseWalkSpeed = myHumanoid.WalkSpeed
+                end
+
+                pcall(function()
+                    myHumanoid.WalkSpeed = SPEED_BOOST_VALUE
+                end)
+            elseif baseWalkSpeed then
+                if myHumanoid then
+                    pcall(function()
+                        myHumanoid.WalkSpeed = baseWalkSpeed
+                    end)
+                end
+
+                baseWalkSpeed = nil
+            end
+
+            task.wait(0.3)
+        end
+    end)
+end
+
+-- ============================================================
+-- Pull: yank a player right in front of us, then glue-latch them
+-- so they can't run. The stand's version of "bring them with it".
+-- ============================================================
+pullTarget = function(targetName: string)
+    local target = Players:FindFirstChild(targetName) :: Player?
+    local myRoot = getRoot(player)
+    local targetRoot = getRoot(target)
+
+    if not target or not myRoot or not targetRoot then
+        reply("[Stand] Can't pull " .. targetName)
+        return
+    end
+
+    targetRoot.CFrame = myRoot.CFrame * CFrame.new(0, 0.5, 3)
+
+    standTargetName = targetName
+    setStandEnabled(true)
+    setStandAction("latch")
+
+    notify("Stand: pull", targetName .. " yanked to you")
+    say("[Stand] " .. targetName .. " pulled")
+end
+
+-- ============================================================
+-- Config save / load (executor file APIs). Persists target,
+-- tracking mode, stand owner, and every toggle. Auto-loads on
+-- script start; also available as .save / .load and UI buttons.
+-- ============================================================
+local function getConfigData()
+    return {
+        target = selectedTargetName,
+        trackingMode = trackingMode,
+        owner = standOwnerName,
+        rSpam = rSpamEnabled,
+        qSpam = qSpamEnabled,
+        autoBlock = autoBlockEnabled,
+        esp = espEnabled,
+        speed = speedBoostEnabled,
+        hide = hideEnabled,
+        silent = silentChat,
+        smart = smartAttackEnabled,
+        wall = wallComboEnabled,
+        ult = autoUltEnabled,
+        beside = besideFollow,
+        standDist = standFollowDist,
+        m1Reset = m1ResetEnabled,
+        lethal = lethalEnabled,
+    }
+end
+
+local function applyConfig(data: any)
+    pcall(function()
+        if type(data.target) == "string" and Players:FindFirstChild(data.target) then
+            selectedTargetName = data.target
+            targetDropdown:Select(data.target)
+        end
+
+        if data.trackingMode == "Orbit" or data.trackingMode == "Latch" then
+            trackingMode = data.trackingMode
+            trackingDropdown:Select(trackingMode)
+        end
+
+        if type(data.owner) == "string" then
+            standOwnerName = data.owner
+        end
+
+        rSpamEnabled = data.rSpam == true
+        qSpamEnabled = data.qSpam == true
+        autoBlockEnabled = data.autoBlock == true
+        espEnabled = data.esp == true
+        speedBoostEnabled = data.speed == true
+        hideEnabled = data.hide ~= false
+        silentChat = data.silent ~= false
+        smartAttackEnabled = data.smart ~= false
+        wallComboEnabled = data.wall == true
+        autoUltEnabled = data.ult == true
+        besideFollow = data.beside == true
+        m1ResetEnabled = data.m1Reset ~= false
+        lethalEnabled = data.lethal == true
+
+        if type(data.standDist) == "number" then
+            standFollowDist = math.clamp(data.standDist, 1, 10)
+        end
+
+        rSpamToggle:Set(rSpamEnabled)
+        qSpamToggle:Set(qSpamEnabled)
+        blockToggle:Set(autoBlockEnabled)
+        espToggle:Set(espEnabled)
+        speedToggle:Set(speedBoostEnabled)
+        hideToggle:Set(hideEnabled)
+        silentToggle:Set(silentChat)
+        smartToggle:Set(smartAttackEnabled)
+        wallToggle:Set(wallComboEnabled)
+        ultToggle:Set(autoUltEnabled)
+        besideToggle:Set(besideFollow)
+        resetToggle:Set(m1ResetEnabled)
+        lethalToggle:Set(lethalEnabled)
+    end)
+end
+
+loadConfig = function()
+    local exists = pcall(function()
+        return isfile(CONFIG_FILE)
+    end)
+
+    if not exists then
+        return
+    end
+
+    local ok, result = pcall(function()
+        local raw = readfile(CONFIG_FILE)
+        applyConfig(game:GetService("HttpService"):JSONDecode(raw))
+    end)
+
+    if not ok then
+        warn("Config load failed:", result)
+    end
+end
+
+saveConfig = function()
+    local ok, result = pcall(function()
+        writefile(CONFIG_FILE, game:GetService("HttpService"):JSONEncode(getConfigData()))
+    end)
+
+    if ok then
+        notify("Config saved", CONFIG_FILE)
+    else
+        warn("Config save failed:", result)
+    end
+end
+
+-- ============================================================
+-- UI
+-- ============================================================
 local function getPlayerNames()
     local names = {}
 
@@ -485,6 +2389,15 @@ local function getPlayerNames()
         end
     end
 
+    table.sort(names)
+
+    return names
+end
+
+-- Owner list includes ourselves (selecting yourself = you drive the stand).
+local function getOwnerNames()
+    local names = getPlayerNames()
+    table.insert(names, player.Name)
     table.sort(names)
 
     return names
@@ -501,26 +2414,43 @@ local Window = WindUI:CreateWindow({
     ToggleKey = Enum.KeyCode.RightShift,
 })
 
+-- ------------------------------------------------------------
+-- Target tab (combo engine)
+-- ------------------------------------------------------------
 local Tab = Window:Tab({
     Title = "Target",
     Icon = "crosshair",
 })
 
 local playerNames = getPlayerNames()
-selectedTargetName = playerNames[1]
 
-local targetDropdown = Tab:Dropdown({
+targetDropdown = Tab:Dropdown({
     Title = "Target player",
     Values = playerNames,
-    Value = selectedTargetName,
+    Value = playerNames[1],
     Multi = false,
     AllowNone = true,
     Callback = function(playerName)
         selectedTargetName = playerName
 
         if comboEnabled then
+            comboSession = comboSession + 1
+            stopOrbit()
             startCombo()
         end
+    end,
+})
+
+selectedTargetName = playerNames[1]
+
+trackingDropdown = Tab:Dropdown({
+    Title = "Tracking mode (Latch = glued)",
+    Values = { "Orbit", "Latch" },
+    Value = trackingMode,
+    Multi = false,
+    AllowNone = false,
+    Callback = function(mode)
+        trackingMode = mode
     end,
 })
 
@@ -531,8 +2461,12 @@ Tab:Button({
 
         targetDropdown:Refresh(names)
 
-        if selectedTargetName and Players:FindFirstChild(selectedTargetName) then
-            targetDropdown:Select(selectedTargetName)
+        if selectedTargetName then
+            -- Keep the stored target even if they're offline right now;
+            -- they get re-selected automatically when they rejoin.
+            if table.find(names, selectedTargetName) then
+                targetDropdown:Select(selectedTargetName)
+            end
         else
             selectedTargetName = names[1]
 
@@ -555,48 +2489,430 @@ Tab:Toggle({
     end,
 })
 
-local playerGui = player:WaitForChild("PlayerGui")
-local existingGui = playerGui:FindFirstChild("CombatTestReopen")
+hideToggle = Tab:Toggle({
+    Title = "Hide at low HP (under map)",
+    Value = hideEnabled,
+    Callback = function(enabled)
+        hideEnabled = enabled
+    end,
+})
 
-if existingGui then
-    existingGui:Destroy()
+blockToggle = Tab:Toggle({
+    Title = "Auto-block (F) near target",
+    Value = false,
+    Callback = function(enabled)
+        autoBlockEnabled = enabled
+    end,
+})
+
+espToggle = Tab:Toggle({
+    Title = "ESP (see players through walls)",
+    Value = false,
+    Callback = function(enabled)
+        espEnabled = enabled
+    end,
+})
+
+speedToggle = Tab:Toggle({
+    Title = "Speed boost",
+    Value = false,
+    Callback = function(enabled)
+        speedBoostEnabled = enabled
+    end,
+})
+
+Tab:Button({
+    Title = "Save settings",
+    Callback = function()
+        if saveConfig then
+            saveConfig()
+        end
+    end,
+})
+
+Tab:Button({
+    Title = "Load settings",
+    Callback = function()
+        if loadConfig then
+            loadConfig()
+        end
+    end,
+})
+
+local statusLabel = Tab:Label({
+    Text = "No target selected",
+})
+
+local function setStatus(text)
+    pcall(function()
+        statusLabel:Set(text)
+    end)
 end
 
-local reopenGui = Instance.new("ScreenGui")
-reopenGui.Name = "CombatTestReopen"
-reopenGui.ResetOnSpawn = false
-reopenGui.IgnoreGuiInset = true
-reopenGui.Parent = playerGui
+-- ------------------------------------------------------------
+-- Stand tab (JoJo mode)
+-- ------------------------------------------------------------
+local StandTab = Window:Tab({
+    Title = "Stand",
+    Icon = "swords",
+})
 
-local reopenButton = Instance.new("TextButton")
-reopenButton.AnchorPoint = Vector2.new(1, 0)
-reopenButton.Position = UDim2.new(1, -16, 0, 72)
-reopenButton.Size = UDim2.fromOffset(105, 34)
-reopenButton.BackgroundColor3 = Color3.fromRGB(35, 35, 42)
-reopenButton.BorderSizePixel = 0
-reopenButton.Text = "Open UI"
-reopenButton.TextColor3 = Color3.fromRGB(255, 255, 255)
-reopenButton.TextSize = 14
-reopenButton.Font = Enum.Font.GothamMedium
-reopenButton.Parent = reopenGui
+ownerDropdown = StandTab:Dropdown({
+    Title = "Stand owner (who commands you)",
+    Values = getOwnerNames(),
+    Value = player.Name,
+    Multi = false,
+    AllowNone = false,
+    Callback = function(ownerName: string)
+        standOwnerName = ownerName
+        notify("Stand owner", ownerName)
+    end,
+})
 
-local corner = Instance.new("UICorner")
-corner.CornerRadius = UDim.new(0, 7)
-corner.Parent = reopenButton
+local standTargetDropdown = StandTab:Dropdown({
+    Title = "Stand target",
+    Values = getPlayerNames(),
+    Value = nil,
+    Multi = false,
+    AllowNone = true,
+    Callback = function(targetName)
+        standTargetName = targetName
+    end,
+})
 
-reopenButton.Activated:Connect(function()
-    if type(Window.Open) == "function" then
-        Window:Open()
-    elseif type(Window.Toggle) == "function" then
-        Window:Toggle()
-    end
-end)
+StandTab:Toggle({
+    Title = "Stand active",
+    Value = false,
+    Callback = function(enabled)
+        setStandEnabled(enabled)
 
+        -- First time enabling: default to following the owner.
+        if enabled and standAction == "stop" then
+            setStandAction("follow")
+        end
+    end,
+})
+
+StandTab:Button({
+    Title = "Follow owner",
+    Callback = function()
+        setStandEnabled(true)
+        setStandAction("follow")
+    end,
+})
+
+StandTab:Button({
+    Title = "Annoy target",
+    Callback = function()
+        if not standTargetName then
+            notify("Stand", "Pick a stand target first")
+            return
+        end
+
+        rSpamEnabled = true
+        setStandEnabled(true)
+        setStandAction("annoy")
+    end,
+})
+
+StandTab:Button({
+    Title = "Fling target",
+    Callback = function()
+        if not standTargetName then
+            notify("Stand", "Pick a stand target first")
+            return
+        end
+
+        setStandEnabled(true)
+        setStandAction("fling")
+    end,
+})
+
+StandTab:Button({
+    Title = "Latch target (glued)",
+    Callback = function()
+        if not standTargetName then
+            notify("Stand", "Pick a stand target first")
+            return
+        end
+
+        setStandEnabled(true)
+        setStandAction("latch")
+    end,
+})
+
+StandTab:Button({
+    Title = "Carry target",
+    Callback = function()
+        if not standTargetName then
+            notify("Stand", "Pick a stand target first")
+            return
+        end
+
+        setStandEnabled(true)
+        setStandAction("carry")
+    end,
+})
+
+StandTab:Button({
+    Title = "Orbit target",
+    Callback = function()
+        if not standTargetName then
+            notify("Stand", "Pick a stand target first")
+            return
+        end
+
+        setStandEnabled(true)
+        setStandAction("orbit")
+    end,
+})
+
+StandTab:Button({
+    Title = "Attack target (combo)",
+    Callback = function()
+        if not standTargetName then
+            notify("Stand", "Pick a stand target first")
+            return
+        end
+
+        setStandEnabled(true)
+        setStandAction("attack")
+        stopCombo()
+        startComboInternal(standTargetName, false)
+    end,
+})
+
+StandTab:Button({
+    Title = "Pull target to you",
+    Callback = function()
+        if not standTargetName then
+            notify("Stand", "Pick a stand target first")
+            return
+        end
+
+        if pullTarget then
+            pullTarget(standTargetName)
+        end
+    end,
+})
+
+StandTab:Button({
+    Title = "Stop stand",
+    Callback = function()
+        setStandAction("stop")
+        stopCombo()
+    end,
+})
+
+rSpamToggle = StandTab:Toggle({
+    Title = "R spam (Burst)",
+    Value = false,
+    Callback = function(enabled)
+        rSpamEnabled = enabled
+    end,
+})
+
+qSpamToggle = StandTab:Toggle({
+    Title = "Q spam (dash/evade)",
+    Value = false,
+    Callback = function(enabled)
+        qSpamEnabled = enabled
+    end,
+})
+
+silentToggle = StandTab:Toggle({
+    Title = "Silent mode (never talks in chat)",
+    Value = silentChat,
+    Callback = function(enabled)
+        silentChat = enabled
+    end,
+})
+
+smartToggle = StandTab:Toggle({
+    Title = "Smart attack (avoid blocks/counters)",
+    Value = smartAttackEnabled,
+    Callback = function(enabled)
+        smartAttackEnabled = enabled
+    end,
+})
+
+wallToggle = StandTab:Toggle({
+    Title = "Wall combo (Q near walls)",
+    Value = wallComboEnabled,
+    Callback = function(enabled)
+        wallComboEnabled = enabled
+    end,
+})
+
+ultToggle = StandTab:Toggle({
+    Title = "Auto ult while fighting",
+    Value = autoUltEnabled,
+    Callback = function(enabled)
+        autoUltEnabled = enabled
+    end,
+})
+
+besideToggle = StandTab:Toggle({
+    Title = "Follow beside owner (not behind)",
+    Value = besideFollow,
+    Callback = function(enabled)
+        besideFollow = enabled
+    end,
+})
+
+resetToggle = StandTab:Toggle({
+    Title = "M1 reset (dash between chains)",
+    Value = m1ResetEnabled,
+    Callback = function(enabled)
+        m1ResetEnabled = enabled
+    end,
+})
+
+lethalToggle = StandTab:Toggle({
+    Title = "Lethal dash (auto while fighting)",
+    Value = lethalEnabled,
+    Callback = function(enabled)
+        lethalEnabled = enabled
+    end,
+})
+
+StandTab:Button({
+    Title = "Lethal dash now",
+    Callback = function()
+        local target = getStandTarget() or getSelectedTarget()
+
+        if not target then
+            notify("Stand", "Pick a target first")
+            return
+        end
+
+        executeLethal(target)
+    end,
+})
+
+local standStatusLabel = StandTab:Label({
+    Text = "Stand: off",
+})
+
+-- ============================================================
+-- Player join / leave handling
+-- ============================================================
+-- Target left the game: keep the selection and let the combo loop
+-- pick them back up automatically once they rejoin.
 Players.PlayerRemoving:Connect(function(leavingPlayer)
     if leavingPlayer.Name == selectedTargetName then
-        selectedTargetName = nil
         stopOrbit()
     end
 end)
+
+-- Someone joined: refresh every dropdown and re-select stored names.
+Players.PlayerAdded:Connect(function()
+    local names = getPlayerNames()
+
+    pcall(function()
+        targetDropdown:Refresh(names)
+        standTargetDropdown:Refresh(names)
+    end)
+
+    local ownerNames = getOwnerNames()
+
+    pcall(function()
+        ownerDropdown:Refresh(ownerNames)
+
+        if standOwnerName and table.find(ownerNames, standOwnerName) then
+            ownerDropdown:Select(standOwnerName)
+        end
+    end)
+
+    if selectedTargetName and table.find(names, selectedTargetName) then
+        pcall(function()
+            targetDropdown:Select(selectedTargetName)
+        end)
+    end
+
+    if standTargetName and table.find(names, standTargetName) then
+        pcall(function()
+            standTargetDropdown:Select(standTargetName)
+        end)
+    end
+end)
+
+-- ============================================================
+-- Status loops
+-- ============================================================
+task.spawn(function()
+    while true do
+        if not selectedTargetName then
+            setStatus("No target selected")
+        else
+            local target = getSelectedTarget()
+            local comboText = comboEnabled and "COMBO ON" or "combo off"
+
+            if not target then
+                setStatus(selectedTargetName .. " left - auto-resumes on rejoin ("
+                    .. comboText .. ")")
+            elseif not isAlive(target) then
+                setStatus(selectedTargetName .. " respawning... (" .. comboText .. ")")
+            else
+                local humanoid = getHumanoid(target)
+                local targetRoot = getRoot(target)
+                local myRoot = getRoot(player)
+                local hpText = "?"
+                local distanceText = "?"
+
+                if humanoid then
+                    hpText = tostring(math.floor(humanoid.Health))
+                end
+
+                if targetRoot and myRoot then
+                    distanceText = string.format("%.0f",
+                        (myRoot.Position - targetRoot.Position).Magnitude)
+                end
+
+                setStatus(selectedTargetName .. ": HP " .. hpText
+                    .. " | " .. distanceText .. " studs | "
+                    .. trackingMode .. " (" .. comboText .. ")")
+            end
+        end
+
+        task.wait(0.75)
+    end
+end)
+
+task.spawn(function()
+    while true do
+        local actionText = standEnabled and standAction or "off"
+        local ownerText = standOwnerName or "?"
+        local targetText = standTargetName or "none"
+        local rText = rSpamEnabled and "ON" or "off"
+        local qText = qSpamEnabled and "ON" or "off"
+
+        pcall(function()
+            standStatusLabel:Set("Owner: " .. ownerText
+                .. " | Action: " .. actionText
+                .. " | Target: " .. targetText
+                .. " | R: " .. rText .. " Q: " .. qText)
+        end)
+
+        task.wait(0.75)
+    end
+end)
+
+-- ============================================================
+-- Startup
+-- ============================================================
+wireChatCommands()
+
+if loadConfig then
+    loadConfig()
+end
+
+keySpamLoop()
+hideLoop()
+autoBlockLoop()
+ultLoop()
+lethalLoop()
+espLoop()
+speedLoop()
 
 Tab:Select()
