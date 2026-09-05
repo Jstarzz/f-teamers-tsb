@@ -69,8 +69,22 @@ local RunService = game:GetService("RunService")
 local Lighting = game:GetService("Lighting")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local VirtualInputManager = game:GetService("VirtualInputManager")
+local UserInputService = game:GetService("UserInputService")
 
 local player = Players.LocalPlayer
+
+-- Weak devices (Android VM / phone): keyboard events are flaky or
+-- missing entirely, so key presses go through the Communicate remote
+-- instead, and cleanup runs at full aggression.
+local isWeakDevice = false
+
+pcall(function()
+    local platform = UserInputService:GetPlatform()
+
+    isWeakDevice = platform == Enum.Platform.Android
+        or platform == Enum.Platform.IOS
+        or UserInputService.TouchEnabled
+end)
 
 -- ============================================================
 -- State
@@ -130,6 +144,8 @@ local wallComboEnabled = false   -- press Q into walls during combos
 local autoUltEnabled = false     -- tap the ult key while fighting
 local besideFollow = false       -- follow beside the owner, not behind
 local standFollowDist = 3        -- follow distance in studs
+local perfAggressive = isWeakDevice -- aggressive "delete the map" perf mode
+local standVisuals = true           -- stand aura + flying movement
 local m1ResetEnabled = true      -- dash after each M1 chain (combo reset)
 local lethalEnabled = false      -- auto lethal dash during fights
 
@@ -159,6 +175,8 @@ local ultToggle: any = nil
 local besideToggle: any = nil
 local resetToggle: any = nil
 local lethalToggle: any = nil
+local aggrToggle: any = nil
+local visualToggle: any = nil
 
 -- Stand movement authority: these actions make the stand own our
 -- character's movement, so the combo engine defers to it.
@@ -263,6 +281,19 @@ local STAND_ANNOY_SPEED = 9
 local STAND_BUMP_INTERVAL = 0.6 -- how often annoy stomps on the victim
 local STAND_CARRY_OFFSET = CFrame.new(0, 3, -2.5) -- held in front of us
 local STAND_FLING_POWER = 120 -- random velocity magnitude per fling frame
+
+-- Stand visuals: aura particles + smooth flying movement instead of
+-- one-frame teleports. Each action glues once it is close enough.
+local STAND_FLIGHT_SPEED = 130         -- studs per second while flying
+local STAND_HOVER_BOB = 0.5            -- hover bob height while following
+local STAND_POKE_RETURN_DELAY = 1.5    -- seconds at owner between annoy darts
+local STAND_POKE_HIT_TIME = 1.0        -- seconds harassing the victim per dart
+
+-- Aggressive perf (weak device / Android VM). Parts outside the keep
+-- radius get stripped client-side; terrain may be cleared too.
+local PERF_AGGRESSIVE_INTERVAL = 2.5  -- aggressive sweep cadence
+local PERF_KEEP_RADIUS = 120           -- parts near any player stay solid
+local AGGRESSIVE_TERRAIN = isWeakDevice -- clear terrain (client side)
 
 -- ============================================================
 -- Character helpers
@@ -748,6 +779,28 @@ local function pressKey(key: Enum.KeyCode)
     end)
 end
 
+-- Key tap that works on weak devices. Roblox on Android (and some
+-- emulators) drops VirtualInputManager keyboard events, but TSB's
+-- dash proves the Communicate remote with Goal = "KeyPress" reaches
+-- the server reliably. On Android we use that path; on PC, VIM.
+local function tapKey(key: Enum.KeyCode)
+    if isWeakDevice then
+        local remote = getRemote()
+
+        if remote then
+            remote:FireServer({
+                Dash = Enum.KeyCode.W,
+                Key = key,
+                Goal = "KeyPress",
+            })
+        end
+
+        return
+    end
+
+    pressKey(key)
+end
+
 -- Dash fired through the Communicate remote (Goal = "KeyPress") - the
 -- reliable way TSB scripts dash. We face the target before dashing
 -- (CFrame.lookAt), so Dash = W is aimed straight at them.
@@ -920,19 +973,12 @@ local function keySpamLoop()
         while true do
             if isAlive(player) then
                 pcall(function()
-                    -- Cast to any: the runtime signature is
-                    -- SendKeyEvent(key, down, processed, game) but some
-                    -- type defs model the older overload instead.
-                    local vim = VirtualInputManager :: any
-
                     if rSpamEnabled then
-                        vim:SendKeyEvent(R_SPAM_KEY, true, false, game)
-                        vim:SendKeyEvent(R_SPAM_KEY, false, false, game)
+                        tapKey(R_SPAM_KEY)
                     end
 
                     if qSpamEnabled then
-                        vim:SendKeyEvent(Q_SPAM_KEY, true, false, game)
-                        vim:SendKeyEvent(Q_SPAM_KEY, false, false, game)
+                        tapKey(Q_SPAM_KEY)
                     end
                 end)
             end
@@ -956,6 +1002,22 @@ local DISABLE_SHADOWS = true
 local LOWER_GRAPHICS = true       -- force lowest quality level
 local UNCAPPED_FPS = true         -- removes the client framerate cap if possible
 
+-- Instances under a StandFX name are our own visuals (aura); the
+-- sweeper must never eat them.
+local function isEffectProtected(instance: Instance): boolean
+    local current: Instance? = instance
+
+    while current do
+        if string.sub(current.Name, 1, 7) == "StandFX" then
+            return true
+        end
+
+        current = current.Parent
+    end
+
+    return false
+end
+
 local function isCleanableEffect(instance)
     return instance:IsA("ParticleEmitter")
         or instance:IsA("Trail")
@@ -970,10 +1032,15 @@ local function cleanupMapEffects()
     local cleaned = 0
 
     for _, instance in ipairs(workspace:GetDescendants()) do
+        if isEffectProtected(instance) then
+            continue
+        end
+
         if CLEANUP_EFFECTS and isCleanableEffect(instance) then
             instance:Destroy()
             cleaned += 1
         elseif CLEANUP_DECOR
+            and not perfAggressive
             and instance:IsA("BasePart")
             and instance.Transparency >= 0.99
             and not instance.CanCollide
@@ -1014,6 +1081,123 @@ local function cleanupLighting()
     end
 end
 
+-- ============================================================
+-- Aggressive perf (weak device / Android VM): strip every map part
+-- outside a keep radius around the action, flatten other players'
+-- rigs, clear terrain once, and instantly kill any effect that
+-- streams back in. All client side - the server is untouched.
+-- ============================================================
+local terrainCleared = false
+
+local function partNearAnyPlayer(part: BasePart): boolean
+    for _, otherPlayer in ipairs(Players:GetPlayers()) do
+        local root = getRoot(otherPlayer)
+
+        if root then
+            local delta = root.Position - part.Position
+
+            if delta.Magnitude <= PERF_KEEP_RADIUS then
+                return true
+            end
+        end
+    end
+
+    return false
+end
+
+local function stripMapPart(part: BasePart)
+    part.Transparency = 1
+    part.CanCollide = false
+    part.CastShadow = false
+
+    for _, child in ipairs(part:GetChildren()) do
+        if child:IsA("Decal")
+            or child:IsA("Texture")
+            or child:IsA("SurfaceGui")
+            or child:IsA("PointLight")
+            or child:IsA("SpotLight")
+            or child:IsA("SurfaceLight") then
+            child:Destroy()
+        end
+    end
+end
+
+-- Heavy pass. Everything here reverses on rejoin/reload, and the
+-- keep radius guarantees wherever anyone actually fights stays solid
+-- (no falling through the arena).
+local function cleanupAggressiveMap()
+    local cleaned = 0
+
+    if AGGRESSIVE_TERRAIN and not terrainCleared then
+        pcall(function()
+            workspace.Terrain:Clear()
+            terrainCleared = true
+        end)
+    end
+
+    -- Single pass: strip far parts AND kill effects/sounds in the
+    -- same scan so we never iterate the whole map twice per sweep.
+    for _, instance in ipairs(workspace:GetDescendants()) do
+        if isEffectProtected(instance) then
+            continue
+        end
+
+        if instance:IsA("BasePart") and instance.Parent then
+            instance.CastShadow = false
+
+            local model = instance:FindFirstAncestorOfClass("Model")
+            local rigged = model
+                and model ~= player.Character
+                and model:FindFirstChildOfClass("Humanoid") ~= nil
+
+            if rigged then
+                -- Other players' rigs: drop material/shadow cost.
+                instance.Material = Enum.Material.SmoothPlastic
+            elseif instance.Anchored and not partNearAnyPlayer(instance) then
+                stripMapPart(instance)
+                cleaned += 1
+            end
+        elseif (CLEANUP_EFFECTS and isCleanableEffect(instance))
+            or (CLEANUP_SOUNDS and instance:IsA("Sound")) then
+            instance:Destroy()
+            cleaned += 1
+        end
+    end
+
+    return cleaned
+end
+
+-- Kill effects/sounds the instant they stream back in. Cheap class
+-- check only: models/characters/parts are ignored, so nothing that
+-- matters is ever caught.
+local effectKiller: RBXScriptConnection? = nil
+
+local function refreshEffectKiller()
+    if effectKiller then
+        effectKiller:Disconnect()
+        effectKiller = nil
+    end
+
+    if not (noLagEnabled and perfAggressive) then
+        return
+    end
+
+    effectKiller = workspace.DescendantAdded:Connect(function(child)
+        if child:IsA("BasePart") or child:IsA("Model") or child:IsA("Humanoid") then
+            return
+        end
+
+        if isEffectProtected(child) then
+            return
+        end
+
+        if (CLEANUP_EFFECTS and isCleanableEffect(child))
+            or (CLEANUP_SOUNDS and child:IsA("Sound")) then
+            child:Destroy()
+        end
+    end)
+end
+
 local function applyQualitySettings()
     if LOWER_GRAPHICS then
         pcall(function()
@@ -1039,7 +1223,14 @@ end
 local function runCleanupNow()
     pcall(applyQualitySettings)
     pcall(cleanupLighting)
-    pcall(cleanupMapEffects)
+
+    if perfAggressive then
+        pcall(cleanupAggressiveMap)
+    else
+        pcall(cleanupMapEffects)
+    end
+
+    refreshEffectKiller()
 end
 
 local function startCleanupLoop()
@@ -1048,11 +1239,16 @@ local function startCleanupLoop()
     task.spawn(function()
         while true do
             if noLagEnabled and not hidden then
-                pcall(cleanupMapEffects)
                 pcall(cleanupLighting)
+
+                if perfAggressive then
+                    pcall(cleanupAggressiveMap)
+                else
+                    pcall(cleanupMapEffects)
+                end
             end
 
-            task.wait(CLEANUP_INTERVAL)
+            task.wait(perfAggressive and PERF_AGGRESSIVE_INTERVAL or CLEANUP_INTERVAL)
         end
     end)
 end
@@ -1081,30 +1277,139 @@ local function getStandOwner(): Player?
     return Players:FindFirstChild(standOwnerName) :: Player?
 end
 
--- follow: hover glued behind the owner.
-local function standFollowTick()
-    local owner = getStandOwner()
+-- ============================================================
+-- Stand visuals + flight
+-- The stand glides toward its goal at STAND_FLIGHT_SPEED instead of
+-- teleporting one frame, so it reads as a spirit that flies: hover
+-- by the owner, lunge out at victims, glide back. A cheap aura
+-- (StandFX, exempt from cleanup) marks it as a floating stand.
+-- ============================================================
+local function standFlyTo(goalCF: CFrame, deltaTime: number, snapDist: number)
     local myRoot = getRoot(player)
+
+    if not myRoot then
+        return
+    end
+
+    if not standVisuals then
+        myRoot.CFrame = goalCF
+        return
+    end
+
+    local currentPos = myRoot.Position
+    local goalPos = goalCF.Position
+    local dist = (goalPos - currentPos).Magnitude
+
+    if dist <= snapDist then
+        myRoot.CFrame = goalCF
+        return
+    end
+
+    local step = math.min(dist, STAND_FLIGHT_SPEED * math.max(deltaTime, 1 / 240))
+    local newPos = currentPos + (goalPos - currentPos) * (step / dist)
+
+    myRoot.CFrame = CFrame.new(newPos) * goalCF.Rotation
+end
+
+-- Hover spot for follow: beside/behind the owner. Returns nil when
+-- the owner is us - the stand IS our character then, so there is no
+-- separate spot to hover at (and no point fighting our own body).
+local function standFollowGoalCF(): CFrame?
+    local owner = getStandOwner()
     local ownerRoot = getRoot(owner)
 
-    if not owner or not myRoot or not ownerRoot then
-        return
+    if not owner or not ownerRoot or owner == player then
+        return nil
     end
 
-    -- If the owner is us, the stand IS our character: teleporting
-    -- "behind ourselves" every frame would just jitter and drift.
-    if owner == player then
-        return
-    end
-
-    -- Behind the owner by default; flanks them when "beside" is on.
     local x = besideFollow and standFollowDist or 0
     local z = besideFollow and 0 or standFollowDist
 
-    myRoot.CFrame = CFrame.lookAt(
+    return CFrame.lookAt(
         ownerRoot.Position + Vector3.new(x, STAND_FOLLOW_HEIGHT, z),
         ownerRoot.Position
     )
+end
+
+-- Aura: a sparkle cloud that makes the stand read as a floating
+-- spirit. All client side; named StandFX so cleanup leaves it alone.
+local standAura: ParticleEmitter? = nil
+
+local function updateStandAura()
+    local myRoot = getRoot(player)
+    local wantAura = standEnabled
+        and standVisuals
+        and standAction ~= "stop"
+        and not hidden
+        and myRoot ~= nil
+
+    local alive = false
+
+    if standAura then
+        local holder = standAura.Parent
+
+        alive = holder ~= nil and holder.Parent ~= nil
+    end
+
+    if wantAura and not alive then
+        local attachTo = myRoot
+
+        if attachTo then
+            pcall(function()
+                local holder = Instance.new("Attachment")
+                holder.Name = "StandFX-Attachment"
+
+                local emitter = Instance.new("ParticleEmitter")
+                emitter.Name = "StandFX-Aura"
+                emitter.Texture = "rbxasset://textures/particles/sparkles_main.dds"
+                emitter.Rate = 16
+                emitter.Lifetime = NumberRange.new(0.35, 0.7)
+                emitter.Speed = NumberRange.new(1, 3)
+                emitter.SpreadAngle = Vector2.new(180, 180)
+                emitter.Size = NumberSequence.new(0.4)
+                emitter.Transparency = NumberSequence.new({
+                    NumberSequenceKeypoint.new(0, 0.55),
+                    NumberSequenceKeypoint.new(1, 1),
+                })
+                emitter.Color = ColorSequence.new(Color3.fromRGB(150, 210, 255))
+                emitter.LightEmission = 1
+                emitter.LightInfluence = 0
+                holder.Parent = attachTo
+                emitter.Parent = holder
+                standAura = emitter
+            end)
+        end
+    elseif not wantAura and alive then
+        local holder = standAura and standAura.Parent
+
+        if holder then
+            holder:Destroy()
+        end
+
+        standAura = nil
+    end
+end
+
+-- Pokemon-style annoy state: hover by the owner, dart at the victim,
+-- harass, then fly home. Falls back to continuous buzzing when there
+-- is no real owner (or you are the owner).
+local standPokePhase = "home" -- home | out | hit | back
+local standPokeTimer = 0
+local standPokeM1Timer = 0
+local standFlingTimer = 0
+
+-- follow: hover glued behind the owner.
+local function standFollowTick(deltaTime)
+    local goalCF = standFollowGoalCF()
+
+    if not goalCF then
+        return
+    end
+
+    -- Hover bob so the stand reads as floating, not standing.
+    local sway = math.sin(os.clock() * 2.4) * STAND_HOVER_BOB
+
+    standFlyTo(goalCF * CFrame.new(0, sway, 0), deltaTime, 0.8)
 end
 
 -- annoy: buzz around the victim, stomp on them every half second.
@@ -1114,48 +1419,136 @@ local function standAnnoyTick(deltaTime)
     local targetRoot = getRoot(target)
 
     if not target or not myRoot or not targetRoot then
+        standPokePhase = "home"
         return
     end
 
+    local predicted = updateSmoothPosition(getPredictedPosition(targetRoot), deltaTime)
+
+    -- Pokemon mode: only when a real owner (not us) is around to fly
+    -- back to. Hover -> dart out -> harass -> fly home, on repeat.
+    if standOwnerName and standOwnerName ~= player.Name and standFollowGoalCF() then
+        standPokeTimer += deltaTime
+
+        if standPokePhase == "home" then
+            local homeCF = standFollowGoalCF()
+
+            if homeCF then
+                local sway = math.sin(os.clock() * 2.2) * STAND_HOVER_BOB
+                standFlyTo(homeCF * CFrame.new(0, sway, 0), deltaTime, 0.9)
+            end
+
+            if standPokeTimer >= STAND_POKE_RETURN_DELAY then
+                standPokePhase = "out"
+                standPokeTimer = 0
+            end
+        elseif standPokePhase == "out" then
+            -- Lunge out above the victim (fly, never teleport).
+            standFlyTo(CFrame.lookAt(
+                predicted + Vector3.new(0, 3, 0),
+                predicted
+            ), deltaTime, 2.5)
+
+            if (myRoot.Position - targetRoot.Position).Magnitude <= 5 then
+                standPokePhase = "hit"
+                standPokeTimer = 0
+                standPokeM1Timer = 0
+            end
+        elseif standPokePhase == "hit" then
+            -- Harass: buzz + stomp + real punches (M1 taps) so the
+            -- dart actually hurts, Pokemon-style.
+            standAngle += STAND_ANNOY_SPEED * deltaTime
+            standBumpTimer += deltaTime
+            standPokeM1Timer -= deltaTime
+
+            standFlyTo(CFrame.lookAt(
+                predicted + Vector3.new(
+                    math.cos(standAngle) * STAND_ANNOY_RADIUS,
+                    1,
+                    math.sin(standAngle) * STAND_ANNOY_RADIUS
+                ),
+                predicted
+            ), deltaTime, 1.2)
+
+            if standPokeM1Timer <= 0 and isAlive(target) then
+                standPokeM1Timer = 0.55
+
+                local remote = getRemote()
+
+                if remote then
+                    remote:FireServer({ Mobile = true, Goal = "LeftClick" })
+                    remote:FireServer({ Mobile = true, Goal = "LeftClickRelease" })
+                end
+            end
+
+            if standBumpTimer >= 0.5 then
+                standBumpTimer = 0
+                standFlyTo(CFrame.lookAt(
+                    targetRoot.Position + Vector3.new(0, 2, 0),
+                    targetRoot.Position
+                ), deltaTime, 1.0)
+            end
+
+            if standPokeTimer >= STAND_POKE_HIT_TIME then
+                standPokePhase = "back"
+                standPokeTimer = 0
+            end
+        else -- back: fly home to the owner's side.
+            local homeCF = standFollowGoalCF()
+
+            if homeCF then
+                standFlyTo(homeCF, deltaTime, 2)
+
+                if (myRoot.Position - homeCF.Position).Magnitude <= 4 then
+                    standPokePhase = "home"
+                    standPokeTimer = 0
+                end
+            else
+                standPokePhase = "home"
+            end
+        end
+
+        return
+    end
+
+    -- No separate owner: classic continuous buzz around the victim.
     standAngle = standAngle + STAND_ANNOY_SPEED * deltaTime
     standBumpTimer += deltaTime
 
-    local predicted = updateSmoothPosition(getPredictedPosition(targetRoot), deltaTime)
-
-    local orbitPosition = predicted + Vector3.new(
-        math.cos(standAngle) * STAND_ANNOY_RADIUS,
-        1,
-        math.sin(standAngle) * STAND_ANNOY_RADIUS
-    )
-
-    myRoot.CFrame = CFrame.lookAt(orbitPosition, predicted)
+    standFlyTo(CFrame.lookAt(
+        predicted + Vector3.new(
+            math.cos(standAngle) * STAND_ANNOY_RADIUS,
+            1,
+            math.sin(standAngle) * STAND_ANNOY_RADIUS
+        ),
+        predicted
+    ), deltaTime, 1.2)
 
     if standBumpTimer >= STAND_BUMP_INTERVAL then
         standBumpTimer = 0
-        myRoot.CFrame = CFrame.lookAt(
+        standFlyTo(CFrame.lookAt(
             targetRoot.Position + Vector3.new(0, 2, 0),
             targetRoot.Position
-        )
+        ), deltaTime, 1.0)
     end
 end
 
--- latch / attack: teleport-glued onto the target so you are always
--- in melee range - they cannot shake you off.
-local function standLatchTick()
+-- latch / attack: glued onto the target so you are always in melee
+-- range - they cannot shake you off.
+local function standLatchTick(deltaTime)
     local target = getStandTarget()
-    local myRoot = getRoot(player)
     local targetRoot = getRoot(target)
 
-    if not target or not myRoot or not targetRoot then
+    if not target or not targetRoot then
         return
     end
 
     local feetPos = getLatchFeetPosition(targetRoot)
 
-    myRoot.CFrame = CFrame.lookAt(
+    standFlyTo(CFrame.lookAt(
         feetPos,
         targetRoot.Position + Vector3.new(0, 1, 0)
-    )
+    ), deltaTime, 1.2)
 end
 
 -- orbit: circle strafe the target at stand speed.
@@ -1172,19 +1565,21 @@ local function standOrbitTick(deltaTime)
 
     local predicted = updateSmoothPosition(getPredictedPosition(targetRoot), deltaTime)
 
-    myRoot.CFrame = CFrame.lookAt(
+    standFlyTo(CFrame.lookAt(
         predicted + Vector3.new(
             math.cos(standAngle) * ORBIT_RADIUS,
             ORBIT_HEIGHT,
             math.sin(standAngle) * ORBIT_RADIUS
         ),
         predicted
-    )
+    ), deltaTime, 1.5)
 end
 
--- fling: glue to the victim, then blast them with random velocity
--- every frame so they rocket around the map.
-local function standFlingTick()
+-- fling: glue to the victim, then cannonball into them - dash through
+-- every beat (dashes DO move people; naked velocity writes on their
+-- root only stick locally). The velocity spam below is kept too, for
+-- whatever client honors it.
+local function standFlingTick(deltaTime)
     local target = getStandTarget()
     local myRoot = getRoot(player)
     local targetRoot = getRoot(target)
@@ -1193,10 +1588,22 @@ local function standFlingTick()
         return
     end
 
-    myRoot.CFrame = CFrame.lookAt(
+    standFlingTimer += deltaTime
+
+    if standFlingTimer >= 0.45 and isAlive(target) and isAlive(player) then
+        standFlingTimer = 0
+
+        -- Ram: face them, dash straight through, and pop our own body
+        -- upward so the collision shoves them around.
+        myRoot.CFrame = CFrame.lookAt(myRoot.Position, targetRoot.Position)
+        fireDashRemote()
+        myRoot.AssemblyLinearVelocity = Vector3.new(0, 90, 0)
+    end
+
+    standFlyTo(CFrame.lookAt(
         targetRoot.Position + Vector3.new(0, 1, 0),
         targetRoot.Position
-    )
+    ), deltaTime, 1.2)
 
     targetRoot.AssemblyLinearVelocity = Vector3.new(
         math.random(-STAND_FLING_POWER, STAND_FLING_POWER),
@@ -1220,6 +1627,8 @@ local function standCarryTick()
 end
 
 local function stopStandMovement()
+    updateStandAura()
+
     if standConnection then
         standConnection:Disconnect()
         standConnection = nil
@@ -1237,6 +1646,11 @@ local function startStandMovement()
     smoothTargetPos = nil
     standAngle = 0
     standBumpTimer = 0
+    standPokePhase = "home"
+    standPokeTimer = 0
+    standPokeM1Timer = 0
+    standFlingTimer = 0
+    updateStandAura()
 
     standConnection = RunService.RenderStepped:Connect(function(deltaTime)
         if not standEnabled or standAction == "stop" then
@@ -1244,19 +1658,21 @@ local function startStandMovement()
             return
         end
 
+        updateStandAura()
+
         -- Hidden below the map: stay put until HP recovers.
         if hidden then
             return
         end
 
         if standAction == "follow" then
-            standFollowTick()
+            standFollowTick(deltaTime)
         elseif standAction == "annoy" then
             standAnnoyTick(deltaTime)
         elseif standAction == "fling" then
-            standFlingTick()
+            standFlingTick(deltaTime)
         elseif standAction == "latch" or standAction == "attack" then
-            standLatchTick()
+            standLatchTick(deltaTime)
         elseif standAction == "carry" then
             standCarryTick()
         elseif standAction == "orbit" then
@@ -1568,6 +1984,8 @@ local COMMAND_HELP = {
     { ".f [on/off]", "block while the target is swinging" },
     { ".nolag [on/off]", "periodic client-side cleanup" },
     { ".clean", "run the cleanup sweep right now" },
+    { ".aggr [on/off]", "max FPS mode (aggressive, deletes map)" },
+    { ".flight [on/off]", "stand aura + flying movement" },
     { ".noclip [on/off]", "walk through walls (client-side)" },
     { ".dash", "manual dash toward the target (M1 reset)" },
     { ".ui", "minimize / restore the UI" },
@@ -1873,6 +2291,39 @@ local function handleCommand(message: string, speakerName: string)
     if command == "clean" then
         runCleanupNow()
         notify("Cleanup", "Effects swept")
+        return
+    end
+
+    if command == "aggr" or command == "perf" then
+        perfAggressive = string.lower(args[2] or "") ~= "off"
+
+        if perfAggressive then
+            noLagEnabled = true
+
+            pcall(function()
+                noLagToggle:Set(true)
+            end)
+        end
+
+        pcall(function()
+            aggrToggle:Set(perfAggressive)
+        end)
+        notify("Max FPS", perfAggressive and "ON (aggressive cleanup)" or "OFF")
+
+        if noLagEnabled then
+            runCleanupNow()
+        end
+
+        return
+    end
+
+    if command == "flight" or command == "aura" then
+        standVisuals = string.lower(args[2] or "") ~= "off"
+
+        pcall(function()
+            visualToggle:Set(standVisuals)
+        end)
+        notify("Stand visuals", standVisuals and "ON (aura + flying movement)" or "OFF")
         return
     end
 
@@ -2257,7 +2708,7 @@ local function ultLoop()
                         and (targetRoot.Position - myRoot.Position).Magnitude <= 30
 
                     if close then
-                        pressKey(ULT_KEY)
+                        tapKey(ULT_KEY)
                     end
                 end
             end
@@ -2415,6 +2866,8 @@ local function getConfigData()
         standDist = standFollowDist,
         m1Reset = m1ResetEnabled,
         lethal = lethalEnabled,
+        perf = perfAggressive,
+        visuals = standVisuals,
     }
 end
 
@@ -2449,6 +2902,14 @@ local function applyConfig(data: any)
         m1ResetEnabled = data.m1Reset ~= false
         lethalEnabled = data.lethal == true
 
+        if data.perf == nil then
+            perfAggressive = isWeakDevice
+        else
+            perfAggressive = data.perf == true
+        end
+
+        standVisuals = data.visuals ~= false
+
         if type(data.standDist) == "number" then
             standFollowDist = math.clamp(data.standDist, 1, 10)
         end
@@ -2467,6 +2928,8 @@ local function applyConfig(data: any)
         besideToggle:Set(besideFollow)
         resetToggle:Set(m1ResetEnabled)
         lethalToggle:Set(lethalEnabled)
+        aggrToggle:Set(perfAggressive)
+        visualToggle:Set(standVisuals)
     end)
 end
 
@@ -2739,6 +3202,24 @@ Tab:Button({
     end,
 })
 
+aggrToggle = Tab:Toggle({
+    Title = "Max FPS mode (aggressive, deletes map)",
+    Value = perfAggressive,
+    Callback = function(enabled)
+        perfAggressive = enabled
+
+        if enabled then
+            noLagEnabled = true
+
+            pcall(function()
+                noLagToggle:Set(true)
+            end)
+
+            runCleanupNow()
+        end
+    end,
+})
+
 noclipToggle = Tab:Toggle({
     Title = "Noclip (walk through walls)",
     Value = false,
@@ -2999,6 +3480,15 @@ lethalToggle = StandTab:Toggle({
     Value = lethalEnabled,
     Callback = function(enabled)
         lethalEnabled = enabled
+    end,
+})
+
+visualToggle = StandTab:Toggle({
+    Title = "Stand visuals (aura + flying movement)",
+    Value = standVisuals,
+    Callback = function(enabled)
+        standVisuals = enabled
+        updateStandAura()
     end,
 })
 
